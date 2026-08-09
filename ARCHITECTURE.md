@@ -53,7 +53,19 @@ src/
 │   ├── QrPairingServer.ts         — QR code pairing: mDNS + TLS + SPAKE2 + encrypted peer info
 │   └── Spake2.ts                  — SPAKE2 key exchange (BoringSSL Ed25519 variant)
 ├── avd/
-│   └── AvdManager.ts              — AVD CRUD, emulator launch/stop
+│   ├── AvdManager.ts              — AVD CRUD, config.ini read/write, emulator launch/stop
+│   ├── DisplayCheck.ts            — Pure display analysis and Play Console rules
+│   └── LaunchPreflight.ts         — Host RAM and acceleration gate before launch
+├── capture/
+│   ├── CapturePaths.ts            — Capture directory resolver, run folders, filenames
+│   ├── DemoMode.ts                — SystemUI demo mode (screenshot mode) controller
+│   ├── DeviceState.ts             — Device setting snapshot/restore + crash recovery
+│   ├── Orientation.ts             — Rotation control, settle detection, PNG header parsing
+│   ├── CaptureService.ts          — Screencap, validation, Markdown/JSON reports
+│   └── MatrixRunner.ts            — Locale x font scale x density cross-product runner
+├── utils/
+│   ├── Logger.ts                  — Output channel logger
+│   └── HostResources.ts           — Host memory, top consumers, acceleration probe
 └── views/
     ├── AvdTreeProvider.ts         — Sidebar: Virtual Devices
     ├── DeviceTreeProvider.ts      — Sidebar: Connected Devices
@@ -66,6 +78,32 @@ src/
 ## Module Descriptions
 
 ### Entry Point
+
+### Layering rule
+
+`src/adb/` and `src/avd/` are the process-wrapper layer and stay free of `vscode`
+imports where practical; `src/capture/` is feature orchestration and may use
+`vscode` for progress, settings, and prompts. All device and emulator I/O still
+goes through `AdbClient` or `AvdManager` — never `child_process` from a view or
+a command handler.
+
+### Two invariants worth knowing
+
+**AVD hardware is written to `config.ini`, not applied at runtime.** `avdmanager
+create avd` writes no `hw.lcd.*` when it has no `-d <profile>` to work from, and
+the emulator then falls back to 320x640 @ 160 dpi with 96 MB of RAM. `AvdManager`
+therefore writes the preset's real hardware into `config.ini` after creation.
+`adb shell wm size` is deliberately never used as a fix — it only changes
+WindowManager's logical size, lives in `/data`, and is lost on wipe. It is
+offered as `reset` only.
+
+**Device mutations are always recoverable.** Anything that changes a device
+setting (rotation, font scale, density, locale, demo mode) first snapshots the
+prior values and persists them to `globalState` *before* the first write. A
+`finally` block restores on success, failure, and cancellation; the persisted
+record covers a VS Code crash, which a `finally` cannot. `wm density` in
+particular survives a device reboot, so a half-finished run would otherwise
+leave a permanently mis-scaled device.
 
 **`src/extension.ts`** — Extension activation and command registration. Orchestrates SDK detection on startup, initializes all managers and views, and wires commands to handlers. If the SDK isn't found, registers placeholder commands that prompt the setup wizard or SDK download.
 

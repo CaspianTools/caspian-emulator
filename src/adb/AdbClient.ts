@@ -1,9 +1,40 @@
 import { spawn, execFile } from 'child_process';
+import * as path from 'path';
+import * as os from 'os';
+import * as fs from 'fs';
 import { SdkInfo, DeviceInfo, LogcatEntry, DeviceFile } from '../types';
 import { Logger } from '../utils/Logger';
 
+export type SettingsNamespace = 'system' | 'secure' | 'global';
+
+export interface WmSize {
+  physical?: { w: number; h: number };
+  override?: { w: number; h: number };
+}
+
+export interface WmDensity {
+  physical?: number;
+  override?: number;
+}
+
+export const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+/**
+ * Characters safe to pass through `adb shell`, which re-parses the joined argv
+ * on the device. Deliberately conservative.
+ */
+const SAFE_SHELL_TOKEN = /^[A-Za-z0-9._:@,+\-/]+$/;
+
+export function assertSafeShellToken(value: string, what: string): void {
+  if (!SAFE_SHELL_TOKEN.test(value)) {
+    throw new Error(`Invalid ${what}: "${value}" contains characters that are unsafe to pass to the device shell.`);
+  }
+}
+
 export class AdbClient {
   private adbPath: string;
+  private apiLevelCache = new Map<string, number>();
+  private screencapCounter = 0;
 
   constructor(sdk: SdkInfo) {
     this.adbPath = sdk.adbPath;
@@ -301,6 +332,192 @@ export class AdbClient {
     } catch {
       return [];
     }
+  }
+
+  // ── Device settings & capture ──
+
+  /**
+   * Run `adb shell <args...>`.
+   *
+   * IMPORTANT: exec() uses execFile, so Node does not invoke a host shell — but
+   * adb joins the argv with spaces and hands the resulting string to the
+   * *device's* sh, which re-parses it. Metacharacters (; & | $ ` " ' space) in
+   * any element are interpreted on the device. Run untrusted values through
+   * assertSafeShellToken() before they get here.
+   */
+  async shell(serial: string, args: string[]): Promise<string> {
+    return this.exec(['shell', ...args], serial);
+  }
+
+  /** Retrying variant, for commands issued against a still-booting device. */
+  async shellRetry(serial: string, args: string[]): Promise<string> {
+    return this.execWithRetry(['shell', ...args], serial);
+  }
+
+  /**
+   * Read a device setting. Returns null when unset — `settings get` prints the
+   * literal string "null", and that distinction is what makes restore correct
+   * (put the old value back vs. delete the key entirely).
+   */
+  async getSetting(serial: string, ns: SettingsNamespace, key: string): Promise<string | null> {
+    const out = (await this.shell(serial, ['settings', 'get', ns, key])).trim();
+    return out === '' || out === 'null' ? null : out;
+  }
+
+  async putSetting(serial: string, ns: SettingsNamespace, key: string, value: string | number): Promise<void> {
+    await this.shell(serial, ['settings', 'put', ns, key, String(value)]);
+  }
+
+  async deleteSetting(serial: string, ns: SettingsNamespace, key: string): Promise<void> {
+    await this.shell(serial, ['settings', 'delete', ns, key]);
+  }
+
+  /** Device API level, cached per serial. */
+  async getApiLevel(serial: string): Promise<number> {
+    const cached = this.apiLevelCache.get(serial);
+    if (cached !== undefined) { return cached; }
+    const level = parseInt(await this.getProp(serial, 'ro.build.version.sdk'), 10) || 0;
+    this.apiLevelCache.set(serial, level);
+    return level;
+  }
+
+  /** Drop cached per-device facts (call when a serial disconnects). */
+  clearDeviceCache(serial: string): void {
+    this.apiLevelCache.delete(serial);
+  }
+
+  /**
+   * Send `am broadcast -a <action> [-e k v]...`.
+   *
+   * Note there is no success signal: am reports "Broadcast completed: result=0"
+   * whether or not the receiver acted on the intent.
+   */
+  async broadcast(serial: string, action: string, extras: Array<[string, string]> = []): Promise<string> {
+    const args = ['am', 'broadcast', '-a', action];
+    for (const [k, v] of extras) { args.push('-e', k, v); }
+    return this.shellRetry(serial, args);
+  }
+
+  /**
+   * Capture the framebuffer as a PNG buffer.
+   *
+   * Prefers `exec-out`, which is one round trip (vs. screencap → pull → rm),
+   * writes nothing to /sdcard, and uses the raw exec: service so there is no
+   * PTY to mangle LF into CRLF — which corrupts PNGs on Windows. Falls back to
+   * the push/pull path for old adb/devices where exec-out is unavailable.
+   */
+  async captureScreenshotBuffer(serial: string): Promise<Buffer> {
+    try {
+      const buf = await this.execBinary(['exec-out', 'screencap', '-p'], serial);
+      if (buf.length >= 24 && buf.subarray(0, 8).equals(PNG_SIGNATURE)) { return buf; }
+      Logger.warn(`exec-out screencap returned ${buf.length} bytes of non-PNG on ${serial}; falling back to pull.`);
+    } catch (err) {
+      Logger.warn(`exec-out screencap failed on ${serial}: ${err}`);
+    }
+
+    const tmp = path.join(os.tmpdir(), `caspian-screencap-${process.pid}-${this.screencapCounter++}.png`);
+    try {
+      await this.screenshot(serial, tmp);
+      return fs.readFileSync(tmp);
+    } finally {
+      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  }
+
+  /** Parse `wm size` output. */
+  async getWmSize(serial: string): Promise<WmSize> {
+    const out = await this.shell(serial, ['wm', 'size']);
+    const physical = out.match(/Physical size:\s*(\d+)x(\d+)/);
+    const override = out.match(/Override size:\s*(\d+)x(\d+)/);
+    return {
+      physical: physical ? { w: parseInt(physical[1], 10), h: parseInt(physical[2], 10) } : undefined,
+      override: override ? { w: parseInt(override[1], 10), h: parseInt(override[2], 10) } : undefined,
+    };
+  }
+
+  /** Parse `wm density` output. */
+  async getWmDensity(serial: string): Promise<WmDensity> {
+    const out = await this.shell(serial, ['wm', 'density']);
+    const physical = out.match(/Physical density:\s*(\d+)/);
+    const override = out.match(/Override density:\s*(\d+)/);
+    return {
+      physical: physical ? parseInt(physical[1], 10) : undefined,
+      override: override ? parseInt(override[1], 10) : undefined,
+    };
+  }
+
+  async setWmDensity(serial: string, dpi: number): Promise<void> {
+    await this.shell(serial, ['wm', 'density', String(dpi)]);
+  }
+
+  async resetWmDensity(serial: string): Promise<void> {
+    await this.shell(serial, ['wm', 'density', 'reset']);
+  }
+
+  async resetWmSize(serial: string): Promise<void> {
+    await this.shell(serial, ['wm', 'size', 'reset']);
+  }
+
+  /** Lock the display to an absolute rotation (0=natural, 1=90° CCW, …). */
+  async setUserRotation(serial: string, rotation: 0 | 1 | 2 | 3): Promise<void> {
+    await this.putSetting(serial, 'system', 'accelerometer_rotation', 0);
+    await this.putSetting(serial, 'system', 'user_rotation', rotation);
+  }
+
+  /** Per-app locales (API 33+). Returns [] when the app follows the system default. */
+  async getAppLocales(serial: string, packageName: string): Promise<string[]> {
+    const out = await this.shell(serial, ['cmd', 'locale', 'get-app-locales', packageName]);
+    const m = out.match(/\[(.*?)\]/);
+    if (!m) { return []; }
+    return m[1].split(',').map(s => s.trim()).filter(Boolean);
+  }
+
+  /**
+   * Set per-app locales (API 33+). An empty list resets to the system default.
+   *
+   * The reset MUST omit --locales entirely: adb joins argv with spaces, so
+   * passing '' collapses to a bare flag with no value and the device shell
+   * errors. AOSP's LocaleManagerShellCommand defaults to an empty LocaleList
+   * when the flag is absent, which is exactly "follow the system".
+   */
+  async setAppLocales(serial: string, packageName: string, tags: string[]): Promise<void> {
+    const args = ['cmd', 'locale', 'set-app-locales', packageName];
+    if (tags.length > 0) { args.push('--locales', tags.join(',')); }
+    await this.shell(serial, args);
+  }
+
+  /** Resolve a package's launcher activity as "pkg/.Activity" (API 24+). */
+  async resolveLauncherActivity(serial: string, packageName: string): Promise<string | undefined> {
+    try {
+      const out = await this.shell(serial, ['cmd', 'package', 'resolve-activity', '--brief', packageName]);
+      if (/No activity found/i.test(out)) { return undefined; }
+      const last = out.trim().split('\n').map(l => l.trim()).filter(Boolean).pop();
+      return last && /^[A-Za-z0-9_.]+\/[A-Za-z0-9_.$]+$/.test(last) ? last : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Force-stop and start an app, waiting for the launch to complete.
+   *
+   * `am start -W -S` gives a synchronous launch-complete signal, which beats
+   * guessing a sleep. Note that am exits 0 even when it prints
+   * "Error: Activity not started", so stdout must be parsed.
+   */
+  async startActivity(serial: string, target: { component?: string; packageName?: string }): Promise<string> {
+    const args = ['am', 'start', '-W', '-S'];
+    if (target.component) {
+      args.push('-n', target.component);
+    } else if (target.packageName) {
+      args.push('-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER', '-p', target.packageName);
+    } else {
+      throw new Error('startActivity requires a component or package name.');
+    }
+    const out = await this.shell(serial, args);
+    const err = out.match(/^Error:.*$/m);
+    if (err) { throw new Error(err[0].trim()); }
+    return out;
   }
 
   // ── Wireless ADB ──

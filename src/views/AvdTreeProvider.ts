@@ -6,20 +6,38 @@ export class AvdTreeItem extends vscode.TreeItem {
   constructor(public readonly avd: AvdInfo) {
     super(avd.displayName || avd.name, vscode.TreeItemCollapsibleState.None);
 
-    this.description = avd.running ? 'Running' : `API ${avd.apiLevel}`;
+    const parts: string[] = [];
+    if (avd.running) { parts.push('Running'); }
+    parts.push(`API ${avd.apiLevel}`);
+    parts.push(avd.displaySummary);
+    this.description = parts.join(' • ');
+
     this.tooltip = [
       `Name: ${avd.name}`,
-      `Device: ${avd.device}`,
+      `Device: ${avd.device || '(none)'}`,
       `API Level: ${avd.apiLevel}`,
       `ABI: ${avd.abi}`,
       `Target: ${avd.target}`,
+      `Display: ${avd.lcdWidth && avd.lcdHeight
+        ? `${avd.lcdWidth}×${avd.lcdHeight}${avd.lcdDensity ? ` @ ${avd.lcdDensity} dpi` : ''}`
+        : 'not configured — the emulator will fall back to 320×640'}`,
+      `RAM: ${avd.ramMb ? `${avd.ramMb} MB` : 'default'}`,
       `Status: ${avd.running ? 'Running' : 'Stopped'}`,
+      ...(avd.displayProblem
+        ? ['', `⚠ ${avd.displayProblem}`, 'Run "Caspian: Check Display Configuration" to fix.']
+        : []),
     ].join('\n');
 
-    this.contextValue = avd.running ? 'avd.running' : 'avd.stopped';
+    // NOTE: package.json matches these with regex (viewItem =~ /^avd\.stopped/),
+    // not equality — a suffix here must not hide Launch/Stop/Delete.
+    const state = avd.running ? 'avd.running' : 'avd.stopped';
+    this.contextValue = avd.displayHealthy ? state : `${state}.brokenDisplay`;
+
     this.iconPath = new vscode.ThemeIcon(
       avd.running ? 'vm-running' : 'vm',
-      avd.running ? new vscode.ThemeColor('testing.iconPassed') : undefined
+      !avd.displayHealthy
+        ? new vscode.ThemeColor('problemsWarningIcon.foreground')
+        : avd.running ? new vscode.ThemeColor('testing.iconPassed') : undefined
     );
   }
 }

@@ -90,6 +90,12 @@ caspian-emulator/
 │   ├── tasks.json        — Build tasks (watch, build)
 │   └── settings.json     — TypeScript SDK path
 ├── src/                   — TypeScript source code
+│   ├── adb/               — ADB wrapper, device tracking, wireless pairing
+│   ├── avd/               — AVD management, display analysis, launch pre-flight
+│   ├── capture/           — Screenshot mode, store capture, locale matrix
+│   ├── sdk/               — SDK detection and download
+│   ├── utils/             — Logger, host resource probes
+│   └── views/             — Tree providers and webview panels
 ├── out/                   — Compiled output (gitignored)
 ├── resources/             — Icons (Icon.png, Icon.svg)
 ├── node_modules/          — Dependencies (gitignored)

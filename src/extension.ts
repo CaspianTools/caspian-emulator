@@ -1,18 +1,35 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as os from 'os';
-import { COMMANDS, VIEWS, CONFIG, DEVICE_PRESETS, getDefaultAbi } from './constants';
+import * as fs from 'fs';
+import { COMMANDS, VIEWS, CONFIG, DEVICE_PRESETS, DISPLAY_RULES, getDefaultAbi } from './constants';
 import { SdkManager } from './sdk/SdkManager';
-import { AdbClient } from './adb/AdbClient';
+import { AdbClient, assertSafeShellToken } from './adb/AdbClient';
 import { DeviceTracker } from './adb/DeviceTracker';
 import { AvdManager } from './avd/AvdManager';
+import { analyzeDisplay, formatDisplayReport, RuntimeDisplay } from './avd/DisplayCheck';
+import { runLaunchPreflight } from './avd/LaunchPreflight';
+import { checkAcceleration, clearAccelerationCache } from './utils/HostResources';
+import { DemoModeController } from './capture/DemoMode';
+import { DeviceStateManager, DeviceStateSnapshot } from './capture/DeviceState';
+import { CaptureService, RunManifest, writeRunReport } from './capture/CaptureService';
+import { CaptureCancelledError, Orientation } from './capture/Orientation';
+import { resolveCaptureRoot, resolveRunDirectory, suggestRunName } from './capture/CapturePaths';
+import {
+  FONT_SCALE_STOPS,
+  MatrixDimensions,
+  MatrixRunner,
+  PER_APP_LOCALE_MIN_API,
+  PSEUDOLOCALES,
+  countCells,
+} from './capture/MatrixRunner';
 import { AvdTreeProvider, AvdTreeItem } from './views/AvdTreeProvider';
 import { DeviceTreeProvider, DeviceTreeItem } from './views/DeviceTreeProvider';
 import { FileExplorerProvider, FileTreeItem } from './views/FileExplorerProvider';
 import { LogcatPanel } from './views/LogcatPanel';
 import { EmulatorScreenPanel } from './views/EmulatorScreenPanel';
 import { QrPairingPanel } from './views/QrPairingPanel';
-import { SdkInfo, DeviceInfo } from './types';
+import { SdkInfo, DeviceInfo, DeviceProfile, AvdHardware } from './types';
 import { Logger } from './utils/Logger';
 
 let sdkManager: SdkManager;
@@ -23,6 +40,9 @@ let avdTreeProvider: AvdTreeProvider;
 let deviceTreeProvider: DeviceTreeProvider;
 let fileExplorerProvider: FileExplorerProvider;
 let statusBarItem: vscode.StatusBarItem;
+let demoStatusBarItem: vscode.StatusBarItem | undefined;
+/** Serials with a capture run in progress, so two runs cannot fight. */
+const captureInFlight = new Set<string>();
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   // Initialize output channel
@@ -107,6 +127,15 @@ async function initializeWithSdk(context: vscode.ExtensionContext, sdk: SdkInfo)
   // Register all commands
   registerCommands(context);
 
+  // Demo mode indicator — deliberately warning-coloured, because demo mode
+  // makes the device lie about battery, signal, and time.
+  demoStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 49);
+  demoStatusBarItem.command = COMMANDS.TOGGLE_DEMO_MODE;
+  demoStatusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+  context.subscriptions.push(demoStatusBarItem);
+  context.subscriptions.push(DemoModeController.onDidChange(() => updateDemoStatusBar()));
+  updateDemoStatusBar();
+
   // Notify when a phone connects but isn't authorized yet
   deviceTracker.on('deviceConnected', (device: DeviceInfo) => {
     if (device.state === 'unauthorized') {
@@ -119,6 +148,15 @@ async function initializeWithSdk(context: vscode.ExtensionContext, sdk: SdkInfo)
         }
       });
     }
+    if (device.state === 'device') {
+      checkPendingRestores(context).catch(err => Logger.warn(`Pending-restore check failed: ${err}`));
+    }
+  });
+
+  deviceTracker.on('deviceDisconnected', (device: DeviceInfo) => {
+    adbClient.clearDeviceCache(device.serial);
+    DemoModeController.forget(device.serial);
+    updateDemoStatusBar();
   });
 
   // Start device tracking
@@ -228,23 +266,57 @@ function registerCommands(context: vscode.ExtensionContext): void {
         );
       }
 
-      const availableProfiles = await avdManager.listDeviceProfiles();
+      // Tri-state: null means enumeration failed, which is NOT the same as
+      // "this SDK has no such profile". Conflating them is what silently
+      // produced AVDs with no display configuration at all.
+      let profiles: DeviceProfile[] | null = null;
+      try {
+        profiles = await avdManager.listDeviceProfiles();
+      } catch (err) {
+        Logger.warn(`Could not list device profiles (${err}). Will attempt -d and fall back.`);
+      }
+
       let deviceProfile: string | undefined = preset.profile;
-      if (availableProfiles.length > 0 && !availableProfiles.some(p => p.id === preset.profile)) {
-        const choice = await vscode.window.showWarningMessage(
-          `Device profile "${preset.name}" is not available in your SDK version. You can still create the AVD without a device skin.`,
-          'Create anyway', 'Cancel'
-        );
-        if (choice !== 'Create anyway') { return; }
+      if (profiles !== null && !profiles.some(p => p.id === preset.profile)) {
+        // Known-missing: skip -d up front. No prompt — we supply the hardware.
+        Logger.info(`Device profile "${preset.profile}" is not in this SDK; applying hardware directly.`);
         deviceProfile = undefined;
       }
 
-      await vscode.window.withProgress(
+      const hardware: AvdHardware = {
+        width: preset.width,
+        height: preset.height,
+        density: preset.density,
+        ram: preset.ram,
+        heap: preset.heap,
+        orientation: preset.orientation,
+        dataPartition: preset.dataPartition,
+        profileId: preset.profile,
+        manufacturer: preset.manufacturer,
+      };
+
+      const result = await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: `Creating ${preset.name} virtual device...` },
-        async () => { await avdManager.createAvd(name, systemImage, deviceProfile); }
+        async () => avdManager.createAvd(name, systemImage, deviceProfile, hardware)
       );
       avdTreeProvider.refresh();
-      vscode.window.showInformationMessage(`${preset.name} virtual device "${name}" created.`);
+
+      const res = `${result.effective.width}×${result.effective.height} @ ${result.effective.density} dpi`;
+      if (result.profileApplied) {
+        vscode.window.showInformationMessage(`${preset.name} virtual device "${name}" created (${res}).`);
+      } else if (preset.foldable) {
+        vscode.window.showWarningMessage(
+          `${preset.name} virtual device "${name}" created with a ${res} display. `
+          + `Your SDK does not include the "${preset.profile}" device definition, so folding postures are not emulated. `
+          + 'Update the SDK command-line tools for full fold support.',
+          'Update SDK Tools'
+        ).then(c => { if (c === 'Update SDK Tools') { vscode.commands.executeCommand(COMMANDS.DOWNLOAD_SDK); } });
+      } else {
+        vscode.window.showInformationMessage(
+          `${preset.name} virtual device "${name}" created (${res}). `
+          + `Your SDK lacks the "${preset.profile}" device definition, so Caspian configured the display directly.`
+        );
+      }
 
     } else {
       // Custom flow
@@ -271,7 +343,12 @@ function registerCommands(context: vscode.ExtensionContext): void {
       });
       if (!name) { return; }
 
-      const profiles = await avdManager.listDeviceProfiles();
+      let profiles: DeviceProfile[] = [];
+      try {
+        profiles = await avdManager.listDeviceProfiles();
+      } catch (err) {
+        Logger.warn(`Could not list device profiles (${err}).`);
+      }
       let device: string | undefined;
       if (profiles.length > 0) {
         const profilePick = await vscode.window.showQuickPick(
@@ -286,61 +363,33 @@ function registerCommands(context: vscode.ExtensionContext): void {
         async () => { await avdManager.createAvd(name, picked.detail, device); }
       );
       avdTreeProvider.refresh();
-      vscode.window.showInformationMessage(`AVD "${name}" created.`);
+
+      // No preset to draw hardware from here, so check the result rather than
+      // silently shipping a 320×640 AVD.
+      const report = analyzeDisplay(avdManager.readAvdConfig(name), name);
+      if (!report.healthy) {
+        vscode.window.showWarningMessage(
+          `AVD "${name}" was created without a usable display configuration (${report.summary}).`,
+          'Set Display', 'Ignore'
+        ).then(c => {
+          if (c === 'Set Display') { vscode.commands.executeCommand(COMMANDS.CHECK_AVD_DISPLAY, name); }
+        });
+      } else {
+        vscode.window.showInformationMessage(`AVD "${name}" created (${report.summary}).`);
+      }
     }
   });
 
   reg(COMMANDS.LAUNCH_AVD, async (item?: AvdTreeItem) => {
     const avdName = item?.avd.name || await pickAvd('Select AVD to launch');
     if (!avdName) { return; }
-
-    const extraArgs = vscode.workspace.getConfiguration(CONFIG.SECTION)
-      .get<string[]>(CONFIG.EMULATOR_ARGS, []);
-
-    const coldBoot = vscode.workspace.getConfiguration(CONFIG.SECTION)
-      .get<boolean>(CONFIG.COLD_BOOT, false);
-    if (coldBoot && !extraArgs.includes('-no-snapshot-load')) {
-      extraArgs.push('-no-snapshot-load');
-    }
-
-    avdManager.launchEmulator(avdName, extraArgs);
-
-    // Show progress notification while emulator boots
-    vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: `Booting emulator: ${avdName}...`, cancellable: false },
-      async () => {
-        // Wait until the emulator appears in device list (up to 60s)
-        for (let i = 0; i < 30; i++) {
-          await new Promise(r => setTimeout(r, 2000));
-          const devices = await adbClient.getDevices();
-          for (const d of devices) {
-            if (d.type === 'emulator' && d.state === 'device') {
-              try {
-                const name = await adbClient.getEmulatorAvdName(d.serial);
-                if (name === avdName) {
-                  avdTreeProvider.refresh();
-                  return;
-                }
-              } catch { /* retry */ }
-            }
-          }
-        }
-        avdTreeProvider.refresh();
-      }
-    );
+    await launchAvdWithPreflight(avdName, { coldBoot: false });
   });
 
   reg(COMMANDS.COLD_BOOT_AVD, async (item?: AvdTreeItem) => {
     const avdName = item?.avd.name || await pickAvd('Select AVD to cold boot');
     if (!avdName) { return; }
-
-    const extraArgs = vscode.workspace.getConfiguration(CONFIG.SECTION)
-      .get<string[]>(CONFIG.EMULATOR_ARGS, []);
-    extraArgs.push('-no-snapshot-load');
-
-    avdManager.launchEmulator(avdName, extraArgs);
-    vscode.window.showInformationMessage(`Cold booting emulator: ${avdName}`);
-    setTimeout(() => avdTreeProvider.refresh(), 5000);
+    await launchAvdWithPreflight(avdName, { coldBoot: true });
   });
 
   reg(COMMANDS.STOP_AVD, async (item?: AvdTreeItem) => {
@@ -850,6 +899,140 @@ function registerCommands(context: vscode.ExtensionContext): void {
     vscode.window.showInformationMessage(`Disconnected ${pick.serial}`);
     deviceTracker.refresh();
   });
+
+  // ── AVD diagnostics ──
+
+  reg(COMMANDS.CHECK_AVD_DISPLAY, async (arg?: AvdTreeItem | string) => {
+    const avdName = typeof arg === 'string' ? arg : arg?.avd.name || await pickAvd('Select AVD to check');
+    if (!avdName) { return; }
+    try {
+      await checkAvdDisplay(avdName);
+    } catch (err) {
+      vscode.window.showErrorMessage(`Display check failed: ${err instanceof Error ? err.message : err}`);
+    }
+  });
+
+  reg(COMMANDS.CHECK_ACCELERATION, async () => {
+    const status = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: 'Checking emulator acceleration...', cancellable: false },
+      () => {
+        clearAccelerationCache();
+        return checkAcceleration((args, timeoutMs) => avdManager.execEmulatorRaw(args, timeoutMs), true);
+      }
+    );
+    Logger.info(`Acceleration check: ${status.raw}`);
+    if (status.ok) {
+      vscode.window.showInformationMessage(`Hardware acceleration is available. ${status.message}`);
+    } else {
+      const extra = process.platform === 'win32'
+        ? ' Enable "Windows Hypervisor Platform" and "Virtual Machine Platform" in Windows Features, then reboot.'
+        : '';
+      vscode.window.showWarningMessage(
+        `Hardware acceleration is unavailable. ${status.message}${extra}`,
+        'How to Fix'
+      ).then(c => {
+        if (c === 'How to Fix') {
+          vscode.env.openExternal(vscode.Uri.parse('https://developer.android.com/studio/run/emulator-acceleration'));
+        }
+      });
+    }
+  });
+
+  reg(COMMANDS.SHOW_EMULATOR_LOG, async (item?: AvdTreeItem) => {
+    const avdName = item?.avd.name || await pickAvd('Select AVD whose launch log to open');
+    if (!avdName) { return; }
+    const logPath = avdManager.getLaunchLogPath(avdName);
+    if (!fs.existsSync(logPath)) {
+      vscode.window.showInformationMessage(`No launch log yet for "${avdName}". Launch it from Caspian to record one.`);
+      return;
+    }
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(logPath));
+    await vscode.window.showTextDocument(doc, { preview: false });
+  });
+
+  // ── Capture ──
+
+  reg(COMMANDS.TOGGLE_DEMO_MODE, async (item?: DeviceTreeItem) => {
+    const serial = item?.device.serial || await pickDevice();
+    if (!serial) { return; }
+    try {
+      const on = await new DemoModeController(adbClient).toggle(serial);
+      updateDemoStatusBar();
+      vscode.window.showInformationMessage(
+        on
+          ? 'Screenshot mode on — status bar shows a fixed clock, full battery, and full signal.'
+          : 'Screenshot mode off — the status bar is back to normal.'
+      );
+    } catch (err) {
+      vscode.window.showErrorMessage(`Screenshot mode failed: ${err instanceof Error ? err.message : err}`);
+    }
+  });
+
+  reg(COMMANDS.CAPTURE_STORE_SCREENSHOTS, async (item?: DeviceTreeItem) => {
+    const serial = item?.device.serial || await pickDevice();
+    if (!serial) { return; }
+    try {
+      await captureStoreScreenshots(serial);
+    } catch (err) {
+      if (!(err instanceof CaptureCancelledError)) {
+        vscode.window.showErrorMessage(`Capture failed: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+  });
+
+  reg(COMMANDS.RUN_CAPTURE_MATRIX, async (item?: DeviceTreeItem) => {
+    const serial = item?.device.serial || await pickDevice();
+    if (!serial) { return; }
+    try {
+      await runCaptureMatrix(context, serial);
+    } catch (err) {
+      if (!(err instanceof CaptureCancelledError)) {
+        vscode.window.showErrorMessage(`Matrix run failed: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+  });
+
+  reg(COMMANDS.OPEN_CAPTURE_FOLDER, async () => {
+    const root = resolveCaptureRoot();
+    if (root.usedFallback) {
+      vscode.window.showInformationMessage(
+        `No workspace is open, so captures go to ${root.dir}.`,
+        'Configure'
+      ).then(c => {
+        if (c === 'Configure') {
+          vscode.commands.executeCommand('workbench.action.openSettings', 'caspian.captureDirectory');
+        }
+      });
+    }
+    await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(root.dir));
+  });
+
+  reg(COMMANDS.RESET_DEVICE_OVERRIDES, async (item?: DeviceTreeItem) => {
+    const serial = item?.device.serial || await pickDevice();
+    if (!serial) { return; }
+
+    const confirm = await vscode.window.showWarningMessage(
+      `Reset display and language overrides on ${serial}?`,
+      {
+        modal: true,
+        detail: 'Clears the display size and density overrides, font scale, forced RTL, '
+          + 'rotation lock, and demo mode. Per-app languages set by a matrix run are not '
+          + 'touched here — use "Restore Now" on the pending-restore prompt for those.',
+      },
+      'Reset'
+    );
+    if (confirm !== 'Reset') { return; }
+
+    const failures = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: 'Resetting device overrides...', cancellable: false },
+      () => new DeviceStateManager(adbClient, context).resetAllOverrides(serial)
+    );
+    if (failures.length === 0) {
+      vscode.window.showInformationMessage('Device overrides reset.');
+    } else {
+      vscode.window.showWarningMessage(`Reset finished, but these could not be cleared: ${failures.join(', ')}.`);
+    }
+  });
 }
 
 // ── Helpers ──
@@ -968,6 +1151,577 @@ function updateStatusBar(devices: DeviceInfo[]): void {
     statusBarItem.text = `$(device-mobile) ${connected.length} device${connected.length > 1 ? 's' : ''}`;
     statusBarItem.tooltip = connected.map(d => `${d.model} (${d.serial})`).join('\n') + '\n\nClick to select active device';
   }
+}
+
+// ── Launch ──
+
+/**
+ * Shared launch path for LAUNCH_AVD and COLD_BOOT_AVD, so the two cannot drift.
+ */
+async function launchAvdWithPreflight(avdName: string, opts: { coldBoot: boolean }): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration(CONFIG.SECTION);
+  // Spread: getConfiguration().get() returns shared (frozen) config state, and
+  // the previous code pushed straight into it.
+  const extraArgs = [...cfg.get<string[]>(CONFIG.EMULATOR_ARGS, [])];
+
+  const coldBoot = opts.coldBoot || cfg.get<boolean>(CONFIG.COLD_BOOT, false);
+  if (coldBoot && !extraArgs.includes('-no-snapshot-load')) {
+    extraArgs.push('-no-snapshot-load');
+  }
+
+  if (!(await runLaunchPreflight(avdManager, avdName))) { return; }
+
+  const captureLog = cfg.get<boolean>(CONFIG.CAPTURE_LOG, true);
+  const proc = avdManager.launchEmulator(avdName, extraArgs, captureLog);
+
+  vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: `Booting emulator: ${avdName}...`, cancellable: false },
+    async () => {
+      // Wait until the emulator appears in the device list (up to 60s), but
+      // bail out early when the log shows the launch has already died.
+      for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+
+        const failure = captureLog ? avdManager.readLaunchFailure(avdName) : undefined;
+        if (failure) {
+          avdTreeProvider.refresh();
+          vscode.window.showErrorMessage(`Emulator failed to start: ${failure}`, 'Show Log').then(c => {
+            if (c === 'Show Log') { vscode.commands.executeCommand(COMMANDS.SHOW_EMULATOR_LOG, { avd: { name: avdName } }); }
+          });
+          return;
+        }
+        if (proc.process && proc.process.exitCode !== null && proc.process.exitCode !== 0) {
+          avdTreeProvider.refresh();
+          vscode.window.showErrorMessage(
+            `Emulator exited immediately (code ${proc.process.exitCode}).`,
+            'Show Log'
+          ).then(c => {
+            if (c === 'Show Log') { vscode.commands.executeCommand(COMMANDS.SHOW_EMULATOR_LOG, { avd: { name: avdName } }); }
+          });
+          return;
+        }
+
+        const devices = await adbClient.getDevices();
+        for (const d of devices) {
+          if (d.type === 'emulator' && d.state === 'device') {
+            try {
+              const name = await adbClient.getEmulatorAvdName(d.serial);
+              if (name === avdName) {
+                avdTreeProvider.refresh();
+                return;
+              }
+            } catch { /* retry */ }
+          }
+        }
+      }
+      avdTreeProvider.refresh();
+    }
+  );
+}
+
+// ── AVD display check ──
+
+/** Languages that are written right-to-left, for the matrix wizard. */
+const RTL_LANGUAGES = new Set(['ar', 'he', 'iw', 'fa', 'ur', 'ps', 'sd', 'yi', 'dv']);
+
+const COMMON_DISPLAY_SPECS = [
+  { label: '1080×2400 @ 420 dpi', width: 1080, height: 2400, density: 420, hint: 'Pixel 6/7/8' },
+  { label: '1080×1920 @ 420 dpi', width: 1080, height: 1920, density: 420, hint: 'Classic 16:9 phone' },
+  { label: '1440×3120 @ 560 dpi', width: 1440, height: 3120, density: 560, hint: 'Pixel 6 Pro/7 Pro' },
+  { label: '1280×2856 @ 480 dpi', width: 1280, height: 2856, density: 480, hint: 'Pixel 9 Pro' },
+  { label: '1440×3040 @ 560 dpi', width: 1440, height: 3040, density: 560, hint: 'Pixel 4 XL' },
+  { label: '2560×1600 @ 320 dpi', width: 2560, height: 1600, density: 320, hint: 'Pixel Tablet' },
+  { label: '1280×800 @ 160 dpi', width: 1280, height: 800, density: 160, hint: '10" tablet' },
+];
+
+async function checkAvdDisplay(avdName: string): Promise<void> {
+  const config = avdManager.readAvdConfig(avdName);
+
+  // Runtime layer only for a running emulator — never a physical device.
+  let runtime: RuntimeDisplay | undefined;
+  const running = deviceTracker.getDevices().filter(d => d.type === 'emulator' && d.state === 'device');
+  let runningSerial: string | undefined;
+  for (const d of running) {
+    try {
+      if (await adbClient.getEmulatorAvdName(d.serial) === avdName) { runningSerial = d.serial; break; }
+    } catch { /* keep looking */ }
+  }
+  if (runningSerial) {
+    try {
+      const [size, density] = await Promise.all([
+        adbClient.getWmSize(runningSerial),
+        adbClient.getWmDensity(runningSerial),
+      ]);
+      runtime = {
+        size: size.physical,
+        override: size.override,
+        density: density.physical,
+        densityOverride: density.override,
+      };
+    } catch (err) {
+      Logger.warn(`wm query failed for ${runningSerial}: ${err}`);
+    }
+  }
+
+  const strict = vscode.workspace.getConfiguration(CONFIG.SECTION)
+    .get<boolean>(CONFIG.PLAY_STRICT_ASPECT, false);
+  const report = analyzeDisplay(config, avdName, runtime, {
+    strictPlayAspect: strict,
+    skinPathExists: (p) => fs.existsSync(p),
+  });
+
+  Logger.info(formatDisplayReport(report));
+
+  if (report.issues.length === 0) {
+    vscode.window.showInformationMessage(
+      `"${avdName}" display looks correct: ${report.summary}. Play screenshot ratio ${report.play.ratio.toFixed(2)}:1.`
+    );
+    return;
+  }
+
+  interface Action { label: string; description?: string; detail?: string; id: string }
+  const actions: Action[] = [];
+  if (report.suggestion) {
+    actions.push({
+      label: `$(check) Fix config.ini → ${report.suggestion.width}×${report.suggestion.height} @ ${report.suggestion.density} dpi`,
+      description: 'Recommended — permanent, survives wipe',
+      detail: report.suggestedPreset ? `Matched preset: ${report.suggestedPreset.name}` : undefined,
+      id: 'fix-preset',
+    });
+  }
+  actions.push({ label: '$(edit) Choose a resolution…', description: 'Pick a common display or enter W×H', id: 'fix-manual' });
+  if (report.issues.some(i => i.kind === 'runtime-override')) {
+    actions.push({
+      label: '$(discard) Clear runtime override (wm size/density reset)',
+      description: 'Undoes a temporary adb override — does not survive wipe',
+      id: 'reset-wm',
+    });
+  }
+  if (report.issues.some(i => i.kind === 'skin-conflict')) {
+    actions.push({ label: '$(circle-slash) Detach conflicting skin', description: 'Sets skin.path=_no_skin', id: 'fix-skin' });
+  }
+  actions.push({ label: '$(go-to-file) Open config.ini', id: 'open' });
+
+  const pick = await vscode.window.showQuickPick(actions, {
+    placeHolder: `${avdName}: ${report.issues.map(i => i.message).join('  •  ')}`,
+    ignoreFocusOut: true,
+  });
+  if (!pick) { return; }
+
+  if (pick.id === 'open') {
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(avdManager.getConfigPath(avdName)));
+    await vscode.window.showTextDocument(doc);
+    return;
+  }
+
+  if (pick.id === 'reset-wm') {
+    if (!runningSerial) {
+      vscode.window.showWarningMessage('That AVD is not running, so there is no runtime override to clear.');
+      return;
+    }
+    await adbClient.resetWmSize(runningSerial);
+    await adbClient.resetWmDensity(runningSerial);
+    vscode.window.showInformationMessage('Runtime display overrides cleared.');
+    return;
+  }
+
+  if (avdManager.isRunning(avdName)) {
+    vscode.window.showWarningMessage('Stop the emulator before changing its configuration.');
+    return;
+  }
+
+  let props: Record<string, string> | undefined;
+
+  if (pick.id === 'fix-skin') {
+    props = { 'skin.path': '_no_skin' };
+    if (report.config) { props['skin.name'] = `${report.config.width}x${report.config.height}`; }
+  } else if (pick.id === 'fix-preset' && report.suggestion) {
+    props = {
+      'hw.lcd.width': String(report.suggestion.width),
+      'hw.lcd.height': String(report.suggestion.height),
+      'hw.lcd.density': String(report.suggestion.density),
+    };
+    if (report.suggestedPreset && (report.ramMb === 0 || report.ramMb <= DISPLAY_RULES.AOSP_FALLBACK_RAM_MB)) {
+      props['hw.ramSize'] = String(report.suggestedPreset.ram);
+      props['vm.heapSize'] = String(report.suggestedPreset.heap);
+    }
+  } else if (pick.id === 'fix-manual') {
+    const specPick = await vscode.window.showQuickPick(
+      [
+        ...COMMON_DISPLAY_SPECS.map(s => ({ label: s.label, description: s.hint, spec: s })),
+        { label: '$(edit) Custom…', description: 'Enter width, height, and density', spec: undefined },
+      ],
+      { placeHolder: 'Select a display size' }
+    );
+    if (!specPick) { return; }
+
+    let width: number, height: number, density: number;
+    if (specPick.spec) {
+      ({ width, height, density } = specPick.spec);
+    } else {
+      const sizeInput = await vscode.window.showInputBox({
+        prompt: 'Display size',
+        placeHolder: '1080x2400',
+        validateInput: v => /^\d{3,4}\s*[x×]\s*\d{3,4}$/.test(v.trim()) ? null : 'Enter a size like 1080x2400',
+      });
+      if (!sizeInput) { return; }
+      const m = sizeInput.trim().match(/^(\d+)\s*[x×]\s*(\d+)$/)!;
+      width = parseInt(m[1], 10);
+      height = parseInt(m[2], 10);
+
+      const densityInput = await vscode.window.showInputBox({
+        prompt: 'Display density (dpi)',
+        value: '420',
+        validateInput: v => {
+          const n = parseInt(v, 10);
+          return Number.isFinite(n) && n >= DISPLAY_RULES.SANE_MIN_DENSITY && n <= DISPLAY_RULES.SANE_MAX_DENSITY
+            ? null
+            : `Enter a density between ${DISPLAY_RULES.SANE_MIN_DENSITY} and ${DISPLAY_RULES.SANE_MAX_DENSITY}`;
+        },
+      });
+      if (!densityInput) { return; }
+      density = parseInt(densityInput, 10);
+    }
+    props = {
+      'hw.lcd.width': String(width),
+      'hw.lcd.height': String(height),
+      'hw.lcd.density': String(density),
+    };
+  }
+
+  if (!props) { return; }
+
+  // disk.dataPartition.size is deliberately never written here: shrinking it
+  // below the existing userdata image corrupts the AVD.
+  avdManager.updateAvdConfig(avdName, props, { backup: true });
+  avdTreeProvider.refresh();
+
+  vscode.window.showInformationMessage(
+    `"${avdName}" updated. Changing the display or RAM invalidates the saved snapshot, so the next start must be a cold boot.`,
+    'Cold Boot Now'
+  ).then(c => {
+    if (c === 'Cold Boot Now') { vscode.commands.executeCommand(COMMANDS.COLD_BOOT_AVD, { avd: { name: avdName } }); }
+  });
+}
+
+// ── Capture ──
+
+function deviceLabelFor(serial: string): string {
+  const device = deviceTracker.getDevices().find(d => d.serial === serial);
+  return device?.model || serial;
+}
+
+async function askRunName(): Promise<string | undefined> {
+  return vscode.window.showInputBox({
+    prompt: 'Capture run name (a folder under the capture directory)',
+    value: suggestRunName(),
+    validateInput: v => /^[A-Za-z0-9._-]+$/.test(v.trim()) ? null : 'Use only letters, numbers, dots, underscores, and hyphens',
+  });
+}
+
+async function reportCaptureRun(
+  runDir: string,
+  manifest: RunManifest,
+  headline: string,
+): Promise<void> {
+  const reportPath = writeRunReport(runDir, manifest);
+  const openAfter = vscode.workspace.getConfiguration(CONFIG.SECTION).get<boolean>(CONFIG.CAPTURE_OPEN_AFTER, true);
+  if (openAfter) {
+    await vscode.commands.executeCommand('markdown.showPreview', vscode.Uri.file(reportPath));
+  }
+  vscode.window.showInformationMessage(headline, 'Open Folder', 'View Report').then(c => {
+    if (c === 'Open Folder') { vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(runDir)); }
+    if (c === 'View Report') { vscode.commands.executeCommand('markdown.showPreview', vscode.Uri.file(reportPath)); }
+  });
+}
+
+async function captureStoreScreenshots(serial: string): Promise<void> {
+  if (captureInFlight.has(serial)) {
+    vscode.window.showWarningMessage('A capture run is already in progress on that device.');
+    return;
+  }
+  const runName = await askRunName();
+  if (!runName) { return; }
+
+  const useDemoMode = vscode.workspace.getConfiguration(CONFIG.SECTION)
+    .get<boolean>(CONFIG.CAPTURE_USE_DEMO_MODE, true);
+  const deviceLabel = deviceLabelFor(serial);
+
+  captureInFlight.add(serial);
+  EmulatorScreenPanel.setPaused(serial, true);
+  try {
+    const service = new CaptureService(adbClient);
+    const outcome = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `Capturing store screenshots on ${deviceLabel}...`, cancellable: true },
+      (progress, token) => service.captureOrientations(serial, deviceLabel, runName, { useDemoMode, token, progress })
+    );
+
+    const failed = outcome.results.filter(r => r.validation.level === 'fail').length;
+    const warned = outcome.results.filter(r => r.validation.level === 'warn').length;
+    const suffix = failed ? ` — ${failed} failed Play validation` : warned ? ` (${warned} warning${warned > 1 ? 's' : ''})` : '';
+
+    await reportCaptureRun(outcome.runDir, {
+      runName,
+      startedAt: new Date().toISOString(),
+      device: { serial, label: deviceLabel },
+      notes: outcome.notes,
+      results: outcome.results,
+    }, `Captured ${outcome.results.length} screenshot${outcome.results.length === 1 ? '' : 's'}${suffix}.`);
+
+    for (const note of outcome.notes) { vscode.window.showWarningMessage(note); }
+  } finally {
+    EmulatorScreenPanel.setPaused(serial, false);
+    captureInFlight.delete(serial);
+    updateDemoStatusBar();
+  }
+}
+
+async function runCaptureMatrix(context: vscode.ExtensionContext, serial: string): Promise<void> {
+  if (captureInFlight.has(serial)) {
+    vscode.window.showWarningMessage('A capture run is already in progress on that device.');
+    return;
+  }
+
+  const packageName = await pickPackage(serial, 'Select the app to test');
+  if (!packageName) { return; }
+
+  const cfg = vscode.workspace.getConfiguration(CONFIG.SECTION);
+  const apiLevel = await adbClient.getApiLevel(serial);
+
+  // Locale axis
+  let locales: string[] = [];
+  if (apiLevel >= PER_APP_LOCALE_MIN_API) {
+    const configured = cfg.get<string[]>(CONFIG.CAPTURE_LOCALES, []);
+    const items = [
+      ...configured.map(tag => ({ label: tag, description: 'From settings', tag })),
+      ...PSEUDOLOCALES.map(p => ({ label: p.tag, description: p.description, tag: p.tag })),
+    ];
+    const picked = await vscode.window.showQuickPick(items, {
+      canPickMany: true,
+      placeHolder: 'Select languages to capture (none = current language only)',
+    });
+    if (!picked) { return; }
+    locales = picked.map(p => p.tag);
+    for (const tag of locales) { assertSafeShellToken(tag, 'locale tag'); }
+  } else {
+    const choice = await vscode.window.showWarningMessage(
+      'Per-app language settings require Android 13 (API 33).',
+      {
+        modal: true,
+        detail: `This device reports API ${apiLevel}. "cmd locale set-app-locales" does not exist before `
+          + 'Android 13, and the alternatives change the whole system, need a framework restart, and are '
+          + 'unreliable on production images — Caspian does not do that.',
+      },
+      'Open Language Settings', 'Continue Without Languages'
+    );
+    if (choice === 'Open Language Settings') {
+      await adbClient.shell(serial, ['am', 'start', '-a', 'android.settings.LOCALE_SETTINGS']);
+      return;
+    }
+    if (choice !== 'Continue Without Languages') { return; }
+  }
+
+  // Font scale axis
+  const defaultScales = cfg.get<number[]>(CONFIG.CAPTURE_FONT_SCALES, [1, 1.3]);
+  const fontPick = await vscode.window.showQuickPick(
+    FONT_SCALE_STOPS.map(s => ({
+      label: `${s}×`,
+      description: s === 1 ? 'Default' : s >= 1.8 ? 'Where text overflow usually shows up' : undefined,
+      picked: defaultScales.includes(s),
+      scale: s,
+    })),
+    { canPickMany: true, placeHolder: 'Select font scales (none = leave unchanged)' }
+  );
+  if (!fontPick) { return; }
+  const fontScales = fontPick.map(p => p.scale);
+
+  // Density axis — default to none selected; this is the risky one.
+  let densities: number[] = [];
+  try {
+    const current = await adbClient.getWmDensity(serial);
+    const physical = current.physical;
+    if (physical) {
+      const options = [
+        { dpi: physical, label: `${physical} dpi (default)` },
+        { dpi: Math.round(physical * 0.85), label: `${Math.round(physical * 0.85)} dpi (small)` },
+        { dpi: Math.round(physical * 1.15), label: `${Math.round(physical * 1.15)} dpi (large)` },
+        { dpi: Math.round(physical * 1.3), label: `${Math.round(physical * 1.3)} dpi (largest)` },
+      ];
+      const densityPick = await vscode.window.showQuickPick(
+        options.map(o => ({ label: o.label, dpi: o.dpi })),
+        { canPickMany: true, placeHolder: 'Select display sizes (none = leave unchanged)' }
+      );
+      if (!densityPick) { return; }
+      densities = densityPick.map(p => p.dpi);
+    }
+  } catch (err) {
+    Logger.warn(`Could not read display density on ${serial}: ${err}`);
+  }
+
+  // Orientation axis
+  const orientationPick = await vscode.window.showQuickPick(
+    [
+      { label: 'Portrait', picked: true, value: 'portrait' as Orientation },
+      { label: 'Landscape', picked: false, value: 'landscape' as Orientation },
+    ],
+    { canPickMany: true, placeHolder: 'Select orientations' }
+  );
+  if (!orientationPick || orientationPick.length === 0) { return; }
+  const orientations = orientationPick.map(p => p.value);
+
+  // Forcing RTL is only worth asking about when no RTL language was picked:
+  // capturing in ar or ar-XB already gives real right-to-left layout with real
+  // text, which is the stronger test.
+  let forceRtl = false;
+  if (!locales.some(tag => RTL_LANGUAGES.has(tag.split('-')[0].toLowerCase()) || tag === 'ar-XB')) {
+    const rtlPick = await vscode.window.showQuickPick(
+      [
+        { label: 'No', description: 'Capture with the normal layout direction', value: false },
+        { label: 'Yes', description: 'Turn on "Force RTL layout direction" for the run', value: true },
+      ],
+      { placeHolder: 'Force right-to-left layout?' }
+    );
+    if (!rtlPick) { return; }
+    forceRtl = rtlPick.value;
+  }
+
+  const runName = await askRunName();
+  if (!runName) { return; }
+
+  const dims: MatrixDimensions = { locales, fontScales, densities, orientations, forceRtl };
+  const total = countCells(dims);
+  const deviceLabel = deviceLabelFor(serial);
+
+  const confirm = await vscode.window.showInformationMessage(
+    `Capture ${total} screenshot${total === 1 ? '' : 's'} of ${packageName} on ${deviceLabel}?`,
+    {
+      modal: true,
+      detail: 'Display settings are changed temporarily and restored when the run finishes, '
+        + 'including if you cancel it.',
+    },
+    'Start'
+  );
+  if (confirm !== 'Start') { return; }
+
+  const stateManager = new DeviceStateManager(adbClient, context);
+  let snapshot: DeviceStateSnapshot | undefined;
+
+  captureInFlight.add(serial);
+  EmulatorScreenPanel.setPaused(serial, true);
+  try {
+    snapshot = await stateManager.capture(serial, deviceLabel, {
+      rotation: true,
+      fontScale: fontScales.length > 0,
+      density: densities.length > 0,
+      rtl: dims.forceRtl,
+      demo: true,
+      packages: locales.length > 0 ? [packageName] : [],
+    });
+    // Persisted BEFORE the first mutation: this is the layer that survives a
+    // VS Code crash, which a finally block cannot.
+    await stateManager.persist(snapshot);
+
+    const demo = new DemoModeController(adbClient);
+    const useDemoMode = cfg.get<boolean>(CONFIG.CAPTURE_USE_DEMO_MODE, true);
+    const notes: string[] = [];
+    if (useDemoMode && !DemoModeController.isActive(serial)) {
+      try {
+        await demo.enter(serial);
+        snapshot.demoModeEntered = true;
+        await stateManager.persist(snapshot);
+      } catch (err) {
+        notes.push(`Screenshot mode unavailable: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+
+    const runner = new MatrixRunner(adbClient, new CaptureService(adbClient));
+    const outcome = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `Capture matrix on ${deviceLabel}`, cancellable: true },
+      (progress, token) => runner.run(
+        { serial, deviceLabel, packageName, runName },
+        dims, progress, token
+      )
+    );
+
+    const { dir: runDir } = resolveRunDirectory(runName);
+    const failed = outcome.results.filter(r => r.validation.level === 'fail').length;
+    await reportCaptureRun(runDir, {
+      runName,
+      startedAt: new Date(snapshot.takenAt).toISOString(),
+      device: { serial, label: deviceLabel, apiLevel },
+      packageName,
+      dimensions: { ...dims },
+      notes: [...notes, ...outcome.notes],
+      results: outcome.results,
+    }, `Captured ${outcome.results.length} screenshot${outcome.results.length === 1 ? '' : 's'}${failed ? ` — ${failed} failed Play validation` : ''}.`);
+  } finally {
+    if (snapshot) {
+      // Restore lives OUTSIDE the cancellable progress: cancelling means "stop
+      // capturing", not "abandon my device in a modified state".
+      const failures = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'Restoring device settings...', cancellable: false },
+        () => stateManager.restore(snapshot!)
+      );
+      if (failures.length === 0) {
+        await stateManager.clearPending(serial);
+      } else {
+        vscode.window.showWarningMessage(
+          `Device not fully restored: ${failures.join('; ')}.`,
+          'Retry Restore'
+        ).then(async c => {
+          if (c === 'Retry Restore') {
+            const again = await stateManager.restore(snapshot!);
+            if (again.length === 0) { await stateManager.clearPending(serial); }
+          }
+        });
+      }
+    }
+    EmulatorScreenPanel.setPaused(serial, false);
+    captureInFlight.delete(serial);
+    updateDemoStatusBar();
+  }
+}
+
+/** Offer to undo settings left behind by a run that did not finish cleanly. */
+async function checkPendingRestores(context: vscode.ExtensionContext): Promise<void> {
+  const manager = new DeviceStateManager(adbClient, context);
+  const connected = new Set(deviceTracker.getDevices().filter(d => d.state === 'device').map(d => d.serial));
+
+  for (const snapshot of manager.listPending()) {
+    if (!connected.has(snapshot.serial)) { continue; }
+    const choice = await vscode.window.showWarningMessage(
+      `Caspian left display settings modified on ${snapshot.deviceLabel} during a previous run.`,
+      'Restore Now', 'Dismiss'
+    );
+    if (choice === 'Restore Now') {
+      const failures = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'Restoring device settings...', cancellable: false },
+        () => manager.restore(snapshot)
+      );
+      if (failures.length === 0) {
+        await manager.clearPending(snapshot.serial);
+        vscode.window.showInformationMessage('Device settings restored.');
+      } else {
+        vscode.window.showWarningMessage(`Could not restore: ${failures.join('; ')}.`);
+      }
+    } else if (choice === 'Dismiss') {
+      await manager.clearPending(snapshot.serial);
+    }
+  }
+}
+
+function updateDemoStatusBar(): void {
+  if (!demoStatusBarItem) { return; }
+  const active = DemoModeController.activeSerials();
+  if (active.length === 0) {
+    demoStatusBarItem.hide();
+  } else {
+    demoStatusBarItem.text = '$(device-camera) Screenshot Mode';
+    demoStatusBarItem.tooltip = `Demo mode is on for ${active.join(', ')}.\n`
+      + 'Battery, signal, and clock are faked. Click to turn it off.';
+    demoStatusBarItem.show();
+  }
+  vscode.commands.executeCommand('setContext', 'caspian.demoModeActive', active.length > 0);
 }
 
 export function deactivate(): void {

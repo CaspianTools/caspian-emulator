@@ -91,6 +91,17 @@ sdkmanager "platform-tools" "emulator" "cmdline-tools;latest"
 | `caspian.emulatorArgs` | string[] | `[]` | Extra args passed to `emulator` on launch |
 | `caspian.logcat.maxLines` | number | `10000` | Max lines retained in logcat viewer |
 | `caspian.scrcpyPath` | string | `""` | Path to scrcpy binary (auto-detected if empty) |
+| `caspian.emulator.checkHostMemory` | boolean | `true` | Warn when free host RAM is below what the AVD needs |
+| `caspian.emulator.memoryHeadroomMb` | number | `1024` | Memory to leave for the host beyond the requirement |
+| `caspian.emulator.checkAcceleration` | boolean | `true` | Check WHPX/HAXM/KVM before the first launch of a session |
+| `caspian.emulator.captureLog` | boolean | `true` | Capture emulator output so launch failures can be reported |
+| `caspian.avd.playStoreStrictAspect` | boolean | `false` | Enforce Play's documented 16:9 rule |
+| `caspian.captureDirectory` | string | `"${workspaceFolder}/.caspian/captures"` | Where capture runs are written |
+| `caspian.capture.useDemoMode` | boolean | `true` | Use screenshot mode during capture runs |
+| `caspian.capture.maxAspectRatio` | number | `2` | Max long/short ratio accepted when validating captures |
+| `caspian.demoMode.clock` | string | `"1000"` | Clock shown in screenshot mode (24-hour HHMM) |
+
+See the [readme](readme.md#settings) for the full list of 28 settings.
 
 ### Emulator Launch Arguments
 
@@ -169,10 +180,20 @@ The extension falls back to `adb shell screencap` which captures screenshots at 
   ```
 - Click the **refresh** button in the Virtual Devices panel
 
-**Emulator won't start**
-- Check if hardware acceleration is enabled (Intel HAXM / KVM)
+**Emulator won't start, or hangs partway through boot**
+- Run **Caspian: Show Emulator Launch Log** — the emulator's own output is captured on every launch and usually names the cause
+- Run **Caspian: Check Emulator Acceleration** to confirm WHPX, HAXM, or KVM is available. Without it the emulator runs in software mode and can take minutes or fail outright. On Windows 11, enable **Windows Hypervisor Platform** and **Virtual Machine Platform** in Windows Features, then reboot
+- If the emulator hangs with no error, run **Caspian: Check Display Configuration**. A virtual device created before v0.6.0 may have only 96 MB of RAM, which is not enough for Android to finish booting — and no amount of wiping data will fix it, because the defect is in `config.ini`
+- Close memory-heavy processes. Caspian warns before launching when free RAM is short and can stop Gradle daemons for you
 - Try adding `-gpu swiftshader_indirect` to `caspian.emulatorArgs`
-- Check emulator logs: `emulator -avd <name> -verbose`
+
+**Play Console rejects my screenshots**
+- Run **Caspian: Check Display Configuration** on the virtual device. If it reports 320x640, the AVD was created without a device profile and is not the device it claims to be — repair it from the same menu, then cold boot
+- Use **Caspian: Capture Store Screenshots**, which validates every shot against Play's size and aspect rules and tells you exactly what to change
+- A full-resolution modern phone screenshot (a Pixel 9 Pro is 2.23:1) exceeds Play's 2:1 limit and needs cropping or padding. The capture report gives you the target height
+
+**A device is stuck at the wrong size, font, or language**
+- Run **Caspian: Reset Device Display & Language Overrides**. `wm density` and `wm size` overrides survive a reboot, so an interrupted matrix run can leave a device mis-scaled
 
 **Device shows "unauthorized"**
 - Check the emulator/device screen for a USB debugging authorization prompt

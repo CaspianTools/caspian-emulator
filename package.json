@@ -1,8 +1,8 @@
 {
   "name": "caspian-emulator",
   "displayName": "Caspian Emulator",
-  "description": "Android emulator management for VS Code — no Android Studio required. AVD control, embedded screen, ADB tools, logcat viewer, file explorer, and automatic SDK setup.",
-  "version": "0.5.0",
+  "description": "Android emulator management for VS Code — no Android Studio required. AVD control, store screenshot capture, locale and accessibility sweeps, embedded screen, ADB tools, logcat viewer, and automatic SDK setup.",
+  "version": "0.6.0",
   "publisher": "CaspianTools",
   "license": "MIT",
   "engines": {
@@ -113,6 +113,110 @@
           "type": "boolean",
           "default": false,
           "description": "Always cold boot emulators (ignore snapshots)."
+        },
+        "caspian.emulator.checkHostMemory": {
+          "type": "boolean",
+          "default": true,
+          "description": "Warn before launching an emulator when the host has less free memory than the virtual device needs."
+        },
+        "caspian.emulator.memoryHeadroomMb": {
+          "type": "number",
+          "default": 1024,
+          "minimum": 0,
+          "maximum": 16384,
+          "description": "Free memory in megabytes to leave for the host beyond the emulator's requirement before warning."
+        },
+        "caspian.emulator.checkAcceleration": {
+          "type": "boolean",
+          "default": true,
+          "description": "Check for hardware acceleration (WHPX, HAXM, or KVM) before the first emulator launch of each session."
+        },
+        "caspian.emulator.captureLog": {
+          "type": "boolean",
+          "default": true,
+          "description": "Capture emulator output to a log file so startup failures can be reported instead of appearing as a hang."
+        },
+        "caspian.avd.playStoreStrictAspect": {
+          "type": "boolean",
+          "default": false,
+          "description": "Report virtual device displays outside a 16:9 to 9:16 aspect ratio as Play Store screenshot problems. Most modern phones are taller than 16:9."
+        },
+        "caspian.captureDirectory": {
+          "type": "string",
+          "default": "${workspaceFolder}/.caspian/captures",
+          "description": "Directory where capture runs are saved. Supports ${workspaceFolder} and ~. Falls back to your home folder when no workspace is open."
+        },
+        "caspian.capture.openAfterCapture": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open the capture report when a capture run finishes."
+        },
+        "caspian.capture.useDemoMode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enter screenshot mode during capture runs so the status bar is clean and deterministic."
+        },
+        "caspian.capture.settleDelayMs": {
+          "type": "number",
+          "default": 500,
+          "minimum": 0,
+          "maximum": 10000,
+          "description": "Extra delay after the screen stops changing, before capturing (milliseconds)."
+        },
+        "caspian.capture.maxAspectRatio": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 4,
+          "description": "Maximum long-side to short-side ratio accepted when validating captures against Play Console rules."
+        },
+        "caspian.capture.fontScales": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "default": [
+            1,
+            1.3
+          ],
+          "description": "Font scales preselected when running the locale and accessibility matrix."
+        },
+        "caspian.capture.locales": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Locale tags offered when running the locale and accessibility matrix, for example en-US or ar."
+        },
+        "caspian.demoMode.clock": {
+          "type": "string",
+          "default": "1000",
+          "description": "Clock shown in screenshot mode, as four digits in 24-hour HHMM form."
+        },
+        "caspian.demoMode.batteryLevel": {
+          "type": "number",
+          "default": 100,
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Battery percentage shown in screenshot mode."
+        },
+        "caspian.demoMode.signalLevel": {
+          "type": "number",
+          "default": 4,
+          "minimum": 0,
+          "maximum": 4,
+          "description": "Wi-Fi and mobile signal bars shown in screenshot mode."
+        },
+        "caspian.demoMode.hideNotifications": {
+          "type": "boolean",
+          "default": true,
+          "description": "Hide notification icons in screenshot mode."
+        },
+        "caspian.demoMode.hideStatusIcons": {
+          "type": "boolean",
+          "default": true,
+          "description": "Hide alarm, Bluetooth, location, and other status icons in screenshot mode."
         }
       }
     },
@@ -331,6 +435,54 @@
         "title": "Pair Device with QR Code",
         "category": "Caspian",
         "icon": "$(radio-tower)"
+      },
+      {
+        "command": "caspian.checkAvdDisplay",
+        "title": "Check Display Configuration",
+        "category": "Caspian",
+        "icon": "$(screen-full)"
+      },
+      {
+        "command": "caspian.checkAcceleration",
+        "title": "Check Emulator Acceleration",
+        "category": "Caspian",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "caspian.showEmulatorLog",
+        "title": "Show Emulator Launch Log",
+        "category": "Caspian",
+        "icon": "$(output)"
+      },
+      {
+        "command": "caspian.toggleDemoMode",
+        "title": "Toggle Screenshot Mode",
+        "category": "Caspian",
+        "icon": "$(device-camera)"
+      },
+      {
+        "command": "caspian.captureStoreScreenshots",
+        "title": "Capture Store Screenshots",
+        "category": "Caspian",
+        "icon": "$(device-camera)"
+      },
+      {
+        "command": "caspian.runCaptureMatrix",
+        "title": "Run Locale & Accessibility Matrix",
+        "category": "Caspian",
+        "icon": "$(table)"
+      },
+      {
+        "command": "caspian.openCaptureFolder",
+        "title": "Open Capture Folder",
+        "category": "Caspian",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "caspian.resetDeviceOverrides",
+        "title": "Reset Device Display & Language Overrides",
+        "category": "Caspian",
+        "icon": "$(debug-restart)"
       }
     ],
     "viewsContainers": {
@@ -403,12 +555,12 @@
       "view/item/context": [
         {
           "command": "caspian.launchAvd",
-          "when": "view == caspian.avdList && viewItem == avd.stopped",
+          "when": "view == caspian.avdList && viewItem =~ /^avd\\.stopped/",
           "group": "inline"
         },
         {
           "command": "caspian.stopAvd",
-          "when": "view == caspian.avdList && viewItem == avd.running",
+          "when": "view == caspian.avdList && viewItem =~ /^avd\\.running/",
           "group": "inline"
         },
         {
@@ -418,7 +570,7 @@
         },
         {
           "command": "caspian.deleteAvd",
-          "when": "view == caspian.avdList && viewItem == avd.stopped",
+          "when": "view == caspian.avdList && viewItem =~ /^avd\\.stopped/",
           "group": "2_delete"
         },
         {
@@ -508,8 +660,43 @@
         },
         {
           "command": "caspian.coldBootAvd",
-          "when": "view == caspian.avdList && viewItem == avd.stopped",
+          "when": "view == caspian.avdList && viewItem =~ /^avd\\.stopped/",
           "group": "inline"
+        },
+        {
+          "command": "caspian.checkAvdDisplay",
+          "when": "view == caspian.avdList && viewItem =~ /brokenDisplay/",
+          "group": "inline"
+        },
+        {
+          "command": "caspian.checkAvdDisplay",
+          "when": "view == caspian.avdList",
+          "group": "1_edit"
+        },
+        {
+          "command": "caspian.showEmulatorLog",
+          "when": "view == caspian.avdList",
+          "group": "3_diagnostics"
+        },
+        {
+          "command": "caspian.captureStoreScreenshots",
+          "when": "view == caspian.deviceList && viewItem =~ /^device\\.(emulator|physical)$/",
+          "group": "3_capture"
+        },
+        {
+          "command": "caspian.runCaptureMatrix",
+          "when": "view == caspian.deviceList && viewItem =~ /^device\\.(emulator|physical)$/",
+          "group": "3_capture"
+        },
+        {
+          "command": "caspian.toggleDemoMode",
+          "when": "view == caspian.deviceList && viewItem =~ /^device\\.(emulator|physical)$/",
+          "group": "3_capture"
+        },
+        {
+          "command": "caspian.resetDeviceOverrides",
+          "when": "view == caspian.deviceList && viewItem =~ /^device\\.(emulator|physical)$/",
+          "group": "3_capture"
         }
       ]
     },

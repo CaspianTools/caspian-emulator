@@ -50,6 +50,10 @@ code --install-extension CaspianTools.caspian-emulator
 | Open shell | Right-click a device → **Open ADB Shell** |
 | Mirror screen | Right-click an emulator → **Show Emulator Screen** |
 | Browse files | Select a device and expand the **Device Files** tree |
+| Clean status bar for screenshots | Right-click a device → **Toggle Screenshot Mode** |
+| Capture store screenshots | Right-click a device → **Capture Store Screenshots** |
+| Test languages and font sizes | Right-click a device → **Run Locale & Accessibility Matrix** |
+| Fix a wrong-sized virtual device | Right-click an AVD → **Check Display Configuration** |
 
 ## Next Steps
 

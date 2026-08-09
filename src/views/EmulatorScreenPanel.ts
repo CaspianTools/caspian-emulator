@@ -18,6 +18,8 @@ export class EmulatorScreenPanel {
   private disposables: vscode.Disposable[] = [];
   private captureInterval: NodeJS.Timeout | undefined;
   private scrcpyProcess: ChildProcess | undefined;
+  /** Set while a capture run owns the device — see setPaused. */
+  private paused = false;
   private usingScrcpy = false;
 
   static show(
@@ -129,11 +131,22 @@ export class EmulatorScreenPanel {
     this.startScreencapLoop(3000);
   }
 
+  /**
+   * Pause the mirror loop for a serial.
+   *
+   * A capture run and this 350ms loop otherwise compete for adb throughput,
+   * and the mirror shows mid-rotation garbage while the run is rotating.
+   */
+  static setPaused(serial: string, paused: boolean): void {
+    const panel = EmulatorScreenPanel.panels.get(serial);
+    if (panel) { panel.paused = paused; }
+  }
+
   private startScreencapLoop(intervalMs: number = 350): void {
     let capturing = false;
 
     const capture = async () => {
-      if (capturing) { return; } // Skip if previous capture still in progress
+      if (capturing || this.paused) { return; } // Skip if a capture is in progress or a run owns the device
       capturing = true;
       try {
         // Get raw PNG binary from device, convert to base64 in Node.js

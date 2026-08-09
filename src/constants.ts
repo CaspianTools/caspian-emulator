@@ -40,6 +40,16 @@ export const COMMANDS = {
   CONNECT_WIFI: 'caspian.connectWifi',
   DISCONNECT_WIFI: 'caspian.disconnectWifi',
   QR_PAIR: 'caspian.qrPair',
+  // AVD diagnostics
+  CHECK_AVD_DISPLAY: 'caspian.checkAvdDisplay',
+  CHECK_ACCELERATION: 'caspian.checkAcceleration',
+  SHOW_EMULATOR_LOG: 'caspian.showEmulatorLog',
+  // Screenshot & capture
+  TOGGLE_DEMO_MODE: 'caspian.toggleDemoMode',
+  CAPTURE_STORE_SCREENSHOTS: 'caspian.captureStoreScreenshots',
+  RUN_CAPTURE_MATRIX: 'caspian.runCaptureMatrix',
+  OPEN_CAPTURE_FOLDER: 'caspian.openCaptureFolder',
+  RESET_DEVICE_OVERRIDES: 'caspian.resetDeviceOverrides',
 } as const;
 
 export const VIEWS = {
@@ -61,6 +71,26 @@ export const CONFIG = {
   FILE_EXPLORER_DEFAULT_PATH: 'fileExplorer.defaultPath',
   AUTO_SELECT_DEVICE: 'autoSelectDevice',
   COLD_BOOT: 'emulator.coldBoot',
+  // Launch pre-flight
+  CHECK_HOST_MEMORY: 'emulator.checkHostMemory',
+  MEMORY_HEADROOM_MB: 'emulator.memoryHeadroomMb',
+  CHECK_ACCELERATION: 'emulator.checkAcceleration',
+  CAPTURE_LOG: 'emulator.captureLog',
+  PLAY_STRICT_ASPECT: 'avd.playStoreStrictAspect',
+  // Capture
+  CAPTURE_DIRECTORY: 'captureDirectory',
+  CAPTURE_OPEN_AFTER: 'capture.openAfterCapture',
+  CAPTURE_USE_DEMO_MODE: 'capture.useDemoMode',
+  CAPTURE_SETTLE_DELAY: 'capture.settleDelayMs',
+  CAPTURE_MAX_ASPECT_RATIO: 'capture.maxAspectRatio',
+  CAPTURE_FONT_SCALES: 'capture.fontScales',
+  CAPTURE_LOCALES: 'capture.locales',
+  // Demo mode
+  DEMO_CLOCK: 'demoMode.clock',
+  DEMO_BATTERY_LEVEL: 'demoMode.batteryLevel',
+  DEMO_SIGNAL_LEVEL: 'demoMode.signalLevel',
+  DEMO_HIDE_NOTIFICATIONS: 'demoMode.hideNotifications',
+  DEMO_HIDE_STATUS_ICONS: 'demoMode.hideStatusIcons',
 } as const;
 
 /** Common SDK install locations per platform */
@@ -104,27 +134,122 @@ export interface DevicePreset {
   profile: string;
   api: number;
   tag: string;
+  /** Framebuffer width in px (hw.lcd.width), portrait-natural. */
+  width: number;
+  /** Framebuffer height in px (hw.lcd.height), portrait-natural. */
+  height: number;
+  /** Android density bucket in dpi (hw.lcd.density) — not physical ppi. */
+  density: number;
+  /** hw.ramSize, MB */
+  ram: number;
+  /** vm.heapSize, MB */
+  heap: number;
+  /** hw.initialOrientation */
+  orientation: 'portrait' | 'landscape';
+  /** disk.dataPartition.size — applied at creation only, never on repair. */
+  dataPartition: string;
+  manufacturer: string;
+  /** True when the real device has more than one physical display. */
+  foldable?: boolean;
 }
 
-/** Curated list of popular Android devices for one-click AVD creation */
+/**
+ * Curated list of popular Android devices for one-click AVD creation.
+ *
+ * The hardware fields are a *fallback* used when this SDK's cmdline-tools do
+ * not carry the device definition (e.g. build 11076708 predates every Pixel 9
+ * profile). Without them `avdmanager create avd` omits hw.lcd.* entirely and
+ * the emulator falls back to 320x640 @ 160 dpi with 96 MB of RAM. When the SDK
+ * *does* have the profile, its values win — see AvdManager.createAvd.
+ */
 export const DEVICE_PRESETS: DevicePreset[] = [
-  { name: 'Pixel 9 Pro',         profile: 'pixel_9_pro',            api: 35, tag: 'google_apis' },
-  { name: 'Pixel 9',             profile: 'pixel_9',                api: 35, tag: 'google_apis' },
-  { name: 'Pixel 8 Pro',         profile: 'pixel_8_pro',            api: 34, tag: 'google_apis' },
-  { name: 'Pixel 8',             profile: 'pixel_8',                api: 34, tag: 'google_apis' },
-  { name: 'Pixel 7 Pro',         profile: 'pixel_7_pro',            api: 33, tag: 'google_apis' },
-  { name: 'Pixel 7',             profile: 'pixel_7',                api: 33, tag: 'google_apis' },
-  { name: 'Pixel 7a',            profile: 'pixel_7a',               api: 33, tag: 'google_apis' },
-  { name: 'Pixel 6 Pro',         profile: 'pixel_6_pro',            api: 32, tag: 'google_apis' },
-  { name: 'Pixel 6',             profile: 'pixel_6',                api: 32, tag: 'google_apis' },
-  { name: 'Pixel 6a',            profile: 'pixel_6a',               api: 32, tag: 'google_apis' },
-  { name: 'Pixel Fold',          profile: 'pixel_fold',             api: 34, tag: 'google_apis' },
-  { name: 'Pixel Tablet',        profile: 'pixel_tablet',           api: 34, tag: 'google_apis' },
-  { name: 'Pixel 4 XL',          profile: 'pixel_4_xl',             api: 30, tag: 'google_apis' },
-  { name: 'Nexus 5X',            profile: 'Nexus 5X',               api: 28, tag: 'google_apis' },
-  { name: '7" Tablet',           profile: '7in WSVGA (Tablet)',     api: 35, tag: 'google_apis' },
-  { name: '10" Tablet',          profile: '10.1in WXGA (Tablet)',   api: 35, tag: 'google_apis' },
+  { name: 'Pixel 9 Pro',  profile: 'pixel_9_pro',          api: 35, tag: 'google_apis', width: 1280, height: 2856, density: 480, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 9',      profile: 'pixel_9',              api: 35, tag: 'google_apis', width: 1080, height: 2424, density: 420, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 8 Pro',  profile: 'pixel_8_pro',          api: 34, tag: 'google_apis', width: 1344, height: 2992, density: 480, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 8',      profile: 'pixel_8',              api: 34, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 7 Pro',  profile: 'pixel_7_pro',          api: 33, tag: 'google_apis', width: 1440, height: 3120, density: 560, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 7',      profile: 'pixel_7',              api: 33, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 7a',     profile: 'pixel_7a',             api: 33, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 6 Pro',  profile: 'pixel_6_pro',          api: 32, tag: 'google_apis', width: 1440, height: 3120, density: 560, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 6',      profile: 'pixel_6',              api: 32, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 6a',     profile: 'pixel_6a',             api: 32, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel Fold',   profile: 'pixel_fold',           api: 34, tag: 'google_apis', width: 2208, height: 1840, density: 420, ram: 2048, heap: 512, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Google', foldable: true },
+  { name: 'Pixel Tablet', profile: 'pixel_tablet',         api: 34, tag: 'google_apis', width: 2560, height: 1600, density: 320, ram: 2048, heap: 512, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 4 XL',   profile: 'pixel_4_xl',           api: 30, tag: 'google_apis', width: 1440, height: 3040, density: 560, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Nexus 5X',     profile: 'Nexus 5X',             api: 28, tag: 'google_apis', width: 1080, height: 1920, density: 420, ram: 1536, heap: 192, orientation: 'portrait',  dataPartition: '2G', manufacturer: 'Google' },
+  { name: '7" Tablet',    profile: '7in WSVGA (Tablet)',   api: 35, tag: 'google_apis', width: 1024, height:  600, density: 160, ram: 2048, heap: 256, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Generic' },
+  { name: '10" Tablet',   profile: '10.1in WXGA (Tablet)', api: 35, tag: 'google_apis', width: 1280, height:  800, density: 160, ram: 2048, heap: 256, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Generic' },
 ];
+
+/** Look up a preset by its avdmanager device-profile id. */
+export function findPresetByProfileId(id: string): DevicePreset | undefined {
+  return DEVICE_PRESETS.find(p => p.profile === id);
+}
+
+/** Best-effort preset match for an existing AVD, for repair suggestions. */
+export function findPresetForAvd(
+  config: Record<string, string>,
+  avdName: string,
+): DevicePreset | undefined {
+  const byDevice = config['hw.device.name'];
+  if (byDevice) {
+    const hit = findPresetByProfileId(byDevice);
+    if (hit) { return hit; }
+  }
+  const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const haystack = slug(`${config['avd.ini.displayname'] || ''} ${avdName}`);
+  // Longest name first, so "Pixel 9 Pro" wins over "Pixel 9".
+  return [...DEVICE_PRESETS]
+    .sort((a, b) => b.name.length - a.name.length)
+    .find(p => haystack.includes(slug(p.name)) || haystack.includes(slug(p.profile)));
+}
+
+/** Display sanity and Play Console screenshot rules, shared by AVD checks and capture validation. */
+export const DISPLAY_RULES = {
+  /** Play Console: each side must be at least this many pixels. */
+  PLAY_MIN_SIDE: 320,
+  /** Play Console: each side must be at most this many pixels. */
+  PLAY_MAX_SIDE: 3840,
+  /**
+   * Play's documented promotional-eligibility ratio. Reported, never the gate:
+   * a Pixel 8 is 2.222:1 and a Pixel 9 Pro is 2.231:1, so enforcing this would
+   * fail every device in DEVICE_PRESETS.
+   */
+  PLAY_PROMO_ASPECT: 16 / 9,
+  /** Practical upload ceiling for long-side / short-side. */
+  PLAY_MAX_ASPECT: 2.0,
+  /**
+   * Backstop for garbage display sizes. Kept below the smallest legitimate
+   * preset (the 1024x600 WSVGA tablet) on purpose — the AOSP 320x640 fallback
+   * has its own explicit fingerprint check, so this floor only needs to catch
+   * sizes no real device profile uses. Raising it to a "modern phone" value
+   * would flag correctly configured tablets as broken.
+   */
+  SANE_MIN_SHORT_SIDE: 600,
+  SANE_MAX_ASPECT: 2.5,
+  SANE_MIN_DENSITY: 120,
+  SANE_MAX_DENSITY: 640,
+  /** Play caps screenshots per listing type. */
+  PLAY_MAX_SHOTS_PER_LOCALE: 8,
+  /** The AOSP hardware-properties.ini fallback — the exact bug fingerprint. */
+  AOSP_FALLBACK_WIDTH: 320,
+  AOSP_FALLBACK_HEIGHT: 640,
+  AOSP_FALLBACK_DENSITY: 160,
+  AOSP_FALLBACK_RAM_MB: 96,
+} as const;
+
+/** Emulator launch pre-flight thresholds. */
+export const LAUNCH_PREFLIGHT = {
+  /** The emulator's own default when hw.ramSize is absent from config.ini. */
+  DEFAULT_AVD_RAM_MB: 1536,
+  /** QEMU + GPU/ANGLE + emulator UI overhead beyond the guest RAM. */
+  EMULATOR_OVERHEAD_MB: 768,
+  /** Free memory to leave for the host on top of the requirement. */
+  DEFAULT_HEADROOM_MB: 1024,
+  TOP_PROCESS_COUNT: 4,
+  PROCESS_QUERY_TIMEOUT_MS: 2500,
+  ACCEL_CHECK_TIMEOUT_MS: 8000,
+} as const;
 
 /** Returns the appropriate system image ABI for the current machine */
 export function getDefaultAbi(): string {

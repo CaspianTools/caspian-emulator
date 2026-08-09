@@ -2,7 +2,7 @@
 
 **Android emulator management for VS Code — no Android Studio required.**
 
-Launch emulators, manage AVDs, install APKs, view logcat, mirror screens, manage apps, and browse device files — all without leaving your editor. The extension can download and set up the entire Android SDK automatically.
+Launch emulators, manage AVDs, install APKs, view logcat, mirror screens, manage apps, and browse device files — all without leaving your editor. Capture Play Store screenshots and sweep your app across languages, font scales, and display sizes in one command. The extension can download and set up the entire Android SDK automatically.
 
 [![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/CaspianTools.caspian-emulator?label=VS%20Code%20Marketplace&color=blue)](https://marketplace.visualstudio.com/items?itemName=CaspianTools.caspian-emulator)
 [![Installs](https://img.shields.io/visual-studio-marketplace/i/CaspianTools.caspian-emulator?color=brightgreen)](https://marketplace.visualstudio.com/items?itemName=CaspianTools.caspian-emulator)
@@ -38,7 +38,26 @@ No Android Studio. No manual path configuration. Just install the extension and 
 - **Clone AVD** — duplicate an existing virtual device for testing variations
 - Boot progress notification — shows progress while emulator starts
 - See running/stopped status at a glance with color-coded icons
+- **Correct hardware, always** — presets carry the real resolution, density, and RAM of the device they name, even when your SDK's command-line tools predate that device profile
+- **Resolution shown in the sidebar**, with a warning icon and one-click repair for any misconfigured virtual device
+- **Low-memory pre-flight** — warns before a launch that would hang, names the processes eating your RAM, and offers to stop Gradle daemons
+- **Acceleration check** — tells you when WHPX/HAXM/KVM is missing instead of letting the emulator hang in software mode
+- **Launch failures are reported** with a link to the emulator log, rather than a progress bar that spins and gives up
 - Custom emulator launch arguments via settings
+
+### Store Screenshots & Release Assets
+- **Screenshot mode** — one toggle for a clean status bar: fixed clock, full battery, full signal, no notification icons. No more hand-typing seven `am broadcast` commands
+- **Capture Store Screenshots** — portrait and landscape in one command, saved to a named run folder
+- Every capture is **validated against Play Console rules** (320-3840 px per side, aspect limits) so you learn about a rejection here, not in the Play Console
+- Each run writes a **Markdown report** with the images inline, plus a `manifest.json` for scripting
+- Orientation is labelled from the captured image, so tablets and foldables are correct, and an orientation-locked app is reported rather than silently duplicated
+
+### Locale & Accessibility Matrix
+- Run your app across **languages x font scales x display sizes x orientations**, capturing every combination
+- Language switching uses the **official per-app locale API** (Android 13+) — no root, no reboot, works on Play system images
+- Built-in **pseudolocales**: `en-XA` (accented, ~30% longer text) finds truncation, `ar-XB` (bidi) finds RTL layout bugs — both without a translator
+- **Your device is always put back**, including when you cancel the run or VS Code crashes mid-sweep
+- **Reset Device Display & Language Overrides** — a panic button if a device is ever left in a modified state
 
 ### Physical Phone Support
 - **Guided USB setup** — step-by-step walkthrough: Developer Options → USB Debugging → authorize connection
@@ -109,7 +128,7 @@ Browse the device filesystem from the sidebar:
 ### Install
 Search **"Caspian Emulator"** in the VS Code Extensions panel, or:
 ```bash
-code --install-extension caspian-emulator-0.5.0.vsix
+code --install-extension caspian-emulator-0.6.0.vsix
 ```
 
 ### First Launch
@@ -144,6 +163,23 @@ All settings are under the `caspian` namespace. Open VS Code Settings and search
 | `caspian.fileExplorer.defaultPath` | string | `"/"` | Default root path when browsing device files. |
 | `caspian.autoSelectDevice` | boolean | `true` | Auto-select newly connected devices. |
 | `caspian.emulator.coldBoot` | boolean | `false` | Always cold boot emulators (ignore snapshots). |
+| `caspian.emulator.checkHostMemory` | boolean | `true` | Warn when the host has less free memory than the AVD needs. |
+| `caspian.emulator.memoryHeadroomMb` | number | `1024` | Memory to leave for the host beyond the emulator's requirement. |
+| `caspian.emulator.checkAcceleration` | boolean | `true` | Check for WHPX/HAXM/KVM before the first launch of a session. |
+| `caspian.emulator.captureLog` | boolean | `true` | Capture emulator output so startup failures can be reported. |
+| `caspian.avd.playStoreStrictAspect` | boolean | `false` | Enforce Play's documented 16:9 rule. Most modern phones are taller. |
+| `caspian.captureDirectory` | string | `"${workspaceFolder}/.caspian/captures"` | Where capture runs are saved. Supports `${workspaceFolder}` and `~`. |
+| `caspian.capture.openAfterCapture` | boolean | `true` | Open the report when a capture run finishes. |
+| `caspian.capture.useDemoMode` | boolean | `true` | Use screenshot mode during capture runs. |
+| `caspian.capture.settleDelayMs` | number | `500` | Extra delay after the screen stops changing, before capturing. |
+| `caspian.capture.maxAspectRatio` | number | `2` | Maximum long/short ratio accepted when validating captures. |
+| `caspian.capture.fontScales` | number[] | `[1, 1.3]` | Font scales preselected in the matrix. |
+| `caspian.capture.locales` | string[] | `[]` | Locale tags offered in the matrix, e.g. `en-US`, `ar`. |
+| `caspian.demoMode.clock` | string | `"1000"` | Clock shown in screenshot mode (24-hour HHMM). |
+| `caspian.demoMode.batteryLevel` | number | `100` | Battery percentage shown in screenshot mode. |
+| `caspian.demoMode.signalLevel` | number | `4` | Signal bars shown in screenshot mode (0-4). |
+| `caspian.demoMode.hideNotifications` | boolean | `true` | Hide notification icons in screenshot mode. |
+| `caspian.demoMode.hideStatusIcons` | boolean | `true` | Hide alarm, Bluetooth, location, and other status icons. |
 
 ## Commands
 
@@ -182,6 +218,14 @@ Open the Command Palette (`Ctrl+Shift+P`) and type **"Caspian"** to see all comm
 | Caspian: Download File from Device | Pull a file from device |
 | Caspian: Upload File to Device | Push a local file to the device |
 | Caspian: Delete File on Device | Delete a file or directory on the device |
+| Caspian: Toggle Screenshot Mode | Clean status bar for store screenshots |
+| Caspian: Capture Store Screenshots | Capture portrait and landscape into a run folder |
+| Caspian: Run Locale & Accessibility Matrix | Sweep languages, font scales, and display sizes |
+| Caspian: Open Capture Folder | Reveal the capture directory |
+| Caspian: Reset Device Display & Language Overrides | Undo any leftover device changes |
+| Caspian: Check Display Configuration | Diagnose and repair an AVD's display |
+| Caspian: Check Emulator Acceleration | Verify WHPX, HAXM, or KVM is available |
+| Caspian: Show Emulator Launch Log | Open the captured emulator output |
 | Caspian: Show Output Log | Open the diagnostics output channel |
 
 ## Documentation

@@ -2,6 +2,35 @@
 
 All notable changes to Caspian Emulator will be documented in this file.
 
+## [0.6.0] - 2026-08-09
+
+### Fixed
+- **Virtual devices created from a preset had a 320x640 display and 96 MB of RAM** — when your SDK's command-line tools did not include a device definition (every Pixel 8 and Pixel 9 profile is missing from the tools Caspian ships), AVD creation fell back to running `avdmanager` with no device profile. Nothing then wrote `hw.lcd.*` or `hw.ramSize` into `config.ini`, so the emulator used its own 320x640 @ 160 dpi / 96 MB defaults. A "Pixel 9 Pro" was neither. Screenshots were rejected by the Play Console, and the emulator could hang partway through boot with no error because 96 MB is not enough to start Android. Caspian now carries the real hardware for all 16 presets and writes it into `config.ini` directly, so a Pixel 9 Pro is 1280x2856 @ 480 dpi with 2048 MB whether or not your SDK knows the profile
+- **Removed the "Create anyway" prompt** shown when a device profile was unavailable — there is no longer a decision to make, because the display is configured either way
+- **Device profile lookup failures are no longer silently ignored** — `avdmanager list device` failing was indistinguishable from "this SDK has no such profile", which routed creation straight into the bug above
+- **Device profile names containing spaces or brackets** (`7" Tablet`, `10" Tablet`, `Nexus 5X`) no longer break AVD creation on Windows, where arguments were passed to `cmd.exe` unquoted
+- **AVD paths resolve correctly when VS Code is launched from Git Bash** — `HOME` is a POSIX path there, which sent config reads and writes to a non-existent directory
+- **Emulator launch failures are reported instead of appearing as a hang** — emulator output was discarded, so a `PANIC:` on startup showed up only as a progress notification that spun for 60 seconds. Output is now captured to a log file, scanned for fatal errors, and surfaced with a "Show Log" button
+- **A failure to spawn the emulator no longer crashes the extension host** — the spawn `error` event had no listener
+- **Emulator launch arguments no longer mutate shared settings state** — `caspian.emulatorArgs` was pushed into directly
+
+### Added
+- **Screenshot mode** — one toggle puts the status bar into a clean, deterministic state for store screenshots: fixed clock, full battery, full signal, no notification or system icons. Replaces the seven-broadcast SystemUI demo-mode incantation. A warning-coloured status bar item shows while it is on, because the device is reporting fake battery and signal
+- **Capture Store Screenshots** — captures the current screen in portrait and landscape into a named run folder, validates each shot against Play Console's size and aspect rules, and writes a Markdown report plus a machine-readable `manifest.json`. Orientation is labelled from the measured image, so tablets and foldables (whose natural orientation is landscape) are labelled correctly, and an orientation-locked app is reported rather than producing a duplicate file
+- **Locale & accessibility matrix** — runs an app across languages, font scales, display densities, and orientations, capturing each combination. Language switching uses the official per-app locale API (`cmd locale set-app-locales`, Android 13+), which needs no root, no reboot, and works on Play system images. Includes the `en-XA` and `ar-XB` pseudolocales for finding text overflow and RTL layout bugs without a translator
+- **Device settings are restored when a run ends**, including if you cancel it or VS Code crashes mid-run — a pending-restore record is written before the first change and offered on the next launch. `wm density` in particular survives a reboot, so a half-finished run would otherwise leave a permanently mis-scaled device
+- **Reset Device Display & Language Overrides** — an unconditional panic button for a device left in a modified state
+- **Check Display Configuration** — reports an AVD's display against Play Console rules and offers a permanent fix in `config.ini`, a manual resolution, clearing a temporary `wm size`/`wm density` override, or detaching a conflicting skin. Backs up `config.ini` before writing
+- **Virtual devices show their resolution in the sidebar**, with a warning icon and a one-click fix on any AVD whose display is misconfigured
+- **Low-memory pre-flight check before launching** — compares the AVD's configured RAM against free host memory and, when short, names the processes responsible. Offers to run `gradlew --stop` when resident Gradle daemons are the cause, then re-measures
+- **Hardware acceleration check** — warns when WHPX, HAXM, or KVM is unavailable, since the emulator then runs in software mode and can appear to hang
+- **Show Emulator Launch Log** — opens the captured output for a virtual device
+- 17 new settings covering the capture directory, screenshot-mode appearance, validation strictness, and pre-flight behaviour
+
+### Changed
+- **`hw.keyboard` is enabled on new virtual devices** so the host keyboard works out of the box
+- **The Play Console 16:9 rule is reported, not enforced** — every current Pixel is about 20:9, so treating 16:9 as a hard requirement would flag correctly configured devices as broken. Set `caspian.avd.playStoreStrictAspect` to enforce it
+
 ## [0.5.0] - 2026-03-13
 
 ### Added

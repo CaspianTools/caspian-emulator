@@ -128,7 +128,10 @@ export class SdkDownloader {
     try {
       if (process.platform === 'win32') {
         const drive = checkPath.substring(0, 2); // e.g., "C:"
+        // -NoProfile matters: a user profile script printing to stdout would
+        // otherwise poison this parse and silently report 0 free bytes.
         const output = await this.execCommand('powershell', [
+          '-NoProfile', '-NonInteractive',
           '-Command', `(Get-PSDrive ${drive[0]}).Free`,
         ]);
         const available = parseInt(output.trim(), 10);
@@ -177,6 +180,7 @@ export class SdkDownloader {
       // Extract zip
       if (process.platform === 'win32') {
         await this.execCommand('powershell', [
+          '-NoProfile', '-NonInteractive',
           '-Command',
           `Expand-Archive -Path '${zipPath}' -DestinationPath '${tempExtractDir}' -Force`,
         ]);
