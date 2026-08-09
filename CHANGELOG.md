@@ -2,6 +2,11 @@
 
 All notable changes to Caspian Emulator will be documented in this file.
 
+## [0.6.1] - 2026-08-09
+
+### Changed
+- **Documentation workflow** — release notes and feature announcements now go to GitHub Discussions only; the GitHub Wiki is no longer maintained
+
 ## [0.6.0] - 2026-08-09
 
 ### Fixed

@@ -83,12 +83,7 @@ Update **all** documentation affected by the changes. Review each file below and
 | `BUILD.md` | Dev setup, build commands, project structure | When build process, dependencies, or dev workflow changes |
 | `START_HERE.md` | Documentation index | When adding or renaming documentation files |
 
-**GitHub Wiki** — if the changes affect features documented in the wiki:
-   - Clone: `git clone https://github.com/Caspian-Explorer/caspian-emulator.wiki.git /tmp/caspian-emulator-wiki`
-   - Pages: Home.md, Getting-Started.md, Configuration.md, AVD-Management.md, ADB-Controls.md, Logcat-Viewer.md, Screen-Mirroring.md, File-Explorer.md, Troubleshooting.md, FAQ.md, _Sidebar.md
-   - New features get their own page + links in `_Sidebar.md` and `Home.md`
-   - Push: `cd /tmp/caspian-emulator-wiki && git add -A && git commit -m "<description>" && git push`
-   - Skip if no wiki pages are affected.
+**Do NOT update the GitHub Wiki.** The wiki is no longer maintained — feature announcements go to GitHub Discussions instead (step 11).
 
 ### 6. Build & Package VSIX
 ```
