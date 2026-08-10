@@ -128,7 +128,7 @@ Browse the device filesystem from the sidebar:
 ### Install
 Search **"Caspian Emulator"** in the VS Code Extensions panel, or:
 ```bash
-code --install-extension caspian-emulator-0.6.1.vsix
+code --install-extension caspian-emulator-1.1.0.vsix
 ```
 
 ### First Launch

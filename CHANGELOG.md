@@ -2,12 +2,7 @@
 
 All notable changes to Caspian Emulator will be documented in this file.
 
-## [0.6.1] - 2026-08-09
-
-### Changed
-- **Documentation workflow** — release notes and feature announcements now go to GitHub Discussions only; the GitHub Wiki is no longer maintained
-
-## [0.6.0] - 2026-08-09
+## [1.1.0] - 2026-08-10
 
 ### Fixed
 - **Virtual devices created from a preset had a 320x640 display and 96 MB of RAM** — when your SDK's command-line tools did not include a device definition (every Pixel 8 and Pixel 9 profile is missing from the tools Caspian ships), AVD creation fell back to running `avdmanager` with no device profile. Nothing then wrote `hw.lcd.*` or `hw.ramSize` into `config.ini`, so the emulator used its own 320x640 @ 160 dpi / 96 MB defaults. A "Pixel 9 Pro" was neither. Screenshots were rejected by the Play Console, and the emulator could hang partway through boot with no error because 96 MB is not enough to start Android. Caspian now carries the real hardware for all 16 presets and writes it into `config.ini` directly, so a Pixel 9 Pro is 1280x2856 @ 480 dpi with 2048 MB whether or not your SDK knows the profile
@@ -35,6 +30,12 @@ All notable changes to Caspian Emulator will be documented in this file.
 ### Changed
 - **`hw.keyboard` is enabled on new virtual devices** so the host keyboard works out of the box
 - **The Play Console 16:9 rule is reported, not enforced** — every current Pixel is about 20:9, so treating 16:9 as a hard requirement would flag correctly configured devices as broken. Set `caspian.avd.playStoreStrictAspect` to enforce it
+- **Documentation workflow** — release notes and feature announcements now go to GitHub Discussions only; the GitHub Wiki is no longer maintained
+
+## [1.0.0] - 2026-07-03
+
+### Changed
+- **First stable release** — published directly to the VS Code Marketplace. Functionally identical to 0.5.0; the release marked the feature set as production-ready
 
 ## [0.5.0] - 2026-03-13
 

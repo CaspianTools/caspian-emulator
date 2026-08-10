@@ -64,6 +64,13 @@ If any issues are found, fix them before proceeding.
 ### 4. Bump Version (MANDATORY — never skip)
 Increment the version number for **every** commit:
 
+0. **Check the Marketplace floor first.** The new version must be greater than the version **currently published on the Marketplace**, not merely greater than local `package.json`. The two can drift apart if anything is ever published out-of-band, and the Marketplace rejects any upload at or below its published version. (This already happened once: a `1.0.0` was published on 2026-07-03 that never existed in git, stranding the repo's `0.6.x` line below it.) Query the live version with:
+   ```powershell
+   $body = @{ filters=@(@{ criteria=@(@{ filterType=7; value="CaspianTools.caspian-emulator" }) }); flags=914 } | ConvertTo-Json -Depth 6
+   (Invoke-RestMethod -Uri "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery?api-version=7.1-preview.1" `
+     -Method Post -ContentType "application/json" -Headers @{Accept="application/json;api-version=7.1-preview.1"} `
+     -Body $body).results[0].extensions[0].versions[0].version
+   ```
 1. **`package.json`** — bump the `version` field (patch by default; minor for new features, major for breaking changes).
 2. **`CHANGELOG.md`** — add a new `## [X.Y.Z] - YYYY-MM-DD` heading above the previous version.
 3. **`readme.md`** — update any version references (e.g., install commands like `code --install-extension caspian-emulator-X.Y.Z.vsix`).

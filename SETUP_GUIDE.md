@@ -183,7 +183,7 @@ The extension falls back to `adb shell screencap` which captures screenshots at 
 **Emulator won't start, or hangs partway through boot**
 - Run **Caspian: Show Emulator Launch Log** — the emulator's own output is captured on every launch and usually names the cause
 - Run **Caspian: Check Emulator Acceleration** to confirm WHPX, HAXM, or KVM is available. Without it the emulator runs in software mode and can take minutes or fail outright. On Windows 11, enable **Windows Hypervisor Platform** and **Virtual Machine Platform** in Windows Features, then reboot
-- If the emulator hangs with no error, run **Caspian: Check Display Configuration**. A virtual device created before v0.6.0 may have only 96 MB of RAM, which is not enough for Android to finish booting — and no amount of wiping data will fix it, because the defect is in `config.ini`
+- If the emulator hangs with no error, run **Caspian: Check Display Configuration**. A virtual device created before v1.1.0 may have only 96 MB of RAM, which is not enough for Android to finish booting — and no amount of wiping data will fix it, because the defect is in `config.ini`
 - Close memory-heavy processes. Caspian warns before launching when free RAM is short and can stop Gradle daemons for you
 - Try adding `-gpu swiftshader_indirect` to `caspian.emulatorArgs`
 
