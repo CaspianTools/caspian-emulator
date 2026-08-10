@@ -43,6 +43,12 @@ No Android Studio. No manual path configuration. Just install the extension and 
 - **Low-memory pre-flight** — warns before a launch that would hang, names the processes eating your RAM, and offers to stop Gradle daemons
 - **Acceleration check** — tells you when WHPX/HAXM/KVM is missing instead of letting the emulator hang in software mode
 - **Launch failures are reported** with a link to the emulator log, rather than a progress bar that spins and gives up
+- **Boot is tracked properly** — Caspian waits for Android itself (`sys.boot_completed` plus a working package manager), not just for the device to appear in `adb devices`, and tells you whether it is waiting, booting, or stalled
+- **A wedged boot is named as one** — a guest that finishes its boot animation but never comes up is detected, the launch log opens automatically, and Repair is one click away
+- **Repair Virtual Device** — stop cleanly, cold boot, or wipe data, each rung stating its cost before you commit to it
+- **Stopping is verified**, and a force kill warns you that it costs the snapshot before it happens
+- **Guest RAM check** — flags a virtual device with too little RAM for its system image, the cause of an emulator that boots and then stops responding
+- **Host memory is watched while the emulator runs**, so a build started alongside it warns you before the guest starts thrashing
 - Custom emulator launch arguments via settings
 
 ### Store Screenshots & Release Assets
@@ -51,6 +57,10 @@ No Android Studio. No manual path configuration. Just install the extension and 
 - Every capture is **validated against Play Console rules** (320-3840 px per side, aspect limits) so you learn about a rejection here, not in the Play Console
 - Each run writes a **Markdown report** with the images inline, plus a `manifest.json` for scripting
 - Orientation is labelled from the captured image, so tablets and foldables are correct, and an orientation-locked app is reported rather than silently duplicated
+- **A rotation that did not happen fails validation** instead of being quietly filed under whichever orientation it measured
+- **Display cutout emulation** — corner, double, punch-hole, tall, waterfall, or none, for checking edge-to-edge layout against a real notch inset
+- **Navigation mode emulation** — gesture, 2-button, or 3-button, without creating a virtual device per shape
+- **Landscape home-screen and widget shots** (opt-in) — works around the launcher refusing to rotate on a phone profile, and marks any shot taken that way in the report
 
 ### Locale & Accessibility Matrix
 - Run your app across **languages x font scales x display sizes x orientations**, capturing every combination
@@ -128,7 +138,7 @@ Browse the device filesystem from the sidebar:
 ### Install
 Search **"Caspian Emulator"** in the VS Code Extensions panel, or:
 ```bash
-code --install-extension caspian-emulator-1.1.0.vsix
+code --install-extension caspian-emulator-1.2.0.vsix
 ```
 
 ### First Launch
@@ -167,6 +177,10 @@ All settings are under the `caspian` namespace. Open VS Code Settings and search
 | `caspian.emulator.memoryHeadroomMb` | number | `1024` | Memory to leave for the host beyond the emulator's requirement. |
 | `caspian.emulator.checkAcceleration` | boolean | `true` | Check for WHPX/HAXM/KVM before the first launch of a session. |
 | `caspian.emulator.captureLog` | boolean | `true` | Capture emulator output so startup failures can be reported. |
+| `caspian.emulator.bootTimeoutSec` | number | `180` | How long to wait for Android to finish booting before reporting a stall (30–900). |
+| `caspian.emulator.watchHostMemory` | boolean | `true` | Warn when host memory runs low while an emulator is running. |
+| `caspian.emulator.lowMemoryFloorMb` | number | `512` | Free memory below which the running-emulator warning fires. `0` disables it. |
+| `caspian.avd.checkGuestRam` | boolean | `true` | Flag virtual devices with less RAM than their system image needs. |
 | `caspian.avd.playStoreStrictAspect` | boolean | `false` | Enforce Play's documented 16:9 rule. Most modern phones are taller. |
 | `caspian.captureDirectory` | string | `"${workspaceFolder}/.caspian/captures"` | Where capture runs are saved. Supports `${workspaceFolder}` and `~`. |
 | `caspian.capture.openAfterCapture` | boolean | `true` | Open the report when a capture run finishes. |
@@ -175,6 +189,8 @@ All settings are under the `caspian` namespace. Open VS Code Settings and search
 | `caspian.capture.maxAspectRatio` | number | `2` | Maximum long/short ratio accepted when validating captures. |
 | `caspian.capture.fontScales` | number[] | `[1, 1.3]` | Font scales preselected in the matrix. |
 | `caspian.capture.locales` | string[] | `[]` | Locale tags offered in the matrix, e.g. `en-US`, `ar`. |
+| `caspian.capture.tabletTrickForLandscape` | boolean | `false` | Lower the density to force a landscape home-screen shot. Marked in the report. |
+| `caspian.capture.detectLeftoverOverrides` | boolean | `true` | Check connecting devices for overrides left by an interrupted run. |
 | `caspian.demoMode.clock` | string | `"1000"` | Clock shown in screenshot mode (24-hour HHMM). |
 | `caspian.demoMode.batteryLevel` | number | `100` | Battery percentage shown in screenshot mode. |
 | `caspian.demoMode.signalLevel` | number | `4` | Signal bars shown in screenshot mode (0-4). |
@@ -222,8 +238,11 @@ Open the Command Palette (`Ctrl+Shift+P`) and type **"Caspian"** to see all comm
 | Caspian: Capture Store Screenshots | Capture portrait and landscape into a run folder |
 | Caspian: Run Locale & Accessibility Matrix | Sweep languages, font scales, and display sizes |
 | Caspian: Open Capture Folder | Reveal the capture directory |
+| Caspian: Set Display Cutout (Notch) | Emulate a corner, double, punch-hole, tall, or waterfall cutout |
+| Caspian: Set Navigation Mode | Switch between gesture, 2-button, and 3-button navigation |
 | Caspian: Reset Device Display & Language Overrides | Undo any leftover device changes |
-| Caspian: Check Display Configuration | Diagnose and repair an AVD's display |
+| Caspian: Check Device Configuration | Diagnose and repair an AVD's display and RAM |
+| Caspian: Repair Virtual Device | Stop cleanly, cold boot, or wipe a stuck emulator |
 | Caspian: Check Emulator Acceleration | Verify WHPX, HAXM, or KVM is available |
 | Caspian: Show Emulator Launch Log | Open the captured emulator output |
 | Caspian: Show Output Log | Open the diagnostics output channel |
@@ -237,7 +256,7 @@ Open the Command Palette (`Ctrl+Shift+P`) and type **"Caspian"** to see all comm
 | [Architecture](ARCHITECTURE.md) | System design and module descriptions |
 | [Build from Source](BUILD.md) | Development setup and packaging |
 | [Changelog](CHANGELOG.md) | Version history |
-| [Wiki](https://github.com/Caspian-Explorer/caspian-emulator/wiki) | Feature guides, FAQ, and troubleshooting |
+| [Discussions](https://github.com/Caspian-Explorer/caspian-emulator/discussions) | Release notes and feature announcements |
 
 ## Requirements
 

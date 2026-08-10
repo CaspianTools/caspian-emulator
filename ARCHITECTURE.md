@@ -53,14 +53,17 @@ src/
 │   ├── QrPairingServer.ts         — QR code pairing: mDNS + TLS + SPAKE2 + encrypted peer info
 │   └── Spake2.ts                  — SPAKE2 key exchange (BoringSSL Ed25519 variant)
 ├── avd/
-│   ├── AvdManager.ts              — AVD CRUD, config.ini read/write, emulator launch/stop
-│   ├── DisplayCheck.ts            — Pure display analysis and Play Console rules
-│   └── LaunchPreflight.ts         — Host RAM and acceleration gate before launch
+│   ├── AvdManager.ts              — AVD CRUD, config.ini read/write, emulator launch/verified stop
+│   ├── BootState.ts               — Pure boot-phase classifier + guest readiness probe
+│   ├── DisplayCheck.ts            — Pure display/RAM analysis and Play Console rules
+│   ├── LaunchPreflight.ts         — Host RAM and acceleration gate before launch
+│   └── MemoryWatcher.ts           — Host memory watch while an emulator is running
 ├── capture/
 │   ├── CapturePaths.ts            — Capture directory resolver, run folders, filenames
 │   ├── DemoMode.ts                — SystemUI demo mode (screenshot mode) controller
 │   ├── DeviceState.ts             — Device setting snapshot/restore + crash recovery
 │   ├── Orientation.ts             — Rotation control, settle detection, PNG header parsing
+│   ├── SystemUiOverlay.ts         — Display-cutout and navigation-bar emulation overlays
 │   ├── CaptureService.ts          — Screencap, validation, Markdown/JSON reports
 │   └── MatrixRunner.ts            — Locale x font scale x density cross-product runner
 ├── utils/
@@ -142,13 +145,19 @@ All methods use `child_process.execFile` for one-shot commands and `child_proces
 - Listing AVDs (via `emulator -list-avds` + config.ini parsing)
 - Creating/deleting AVDs
 - Launching emulators (detached processes)
-- Stopping emulators (via `adb emu kill`)
-- Tracking running emulator processes
+- Stopping emulators via `adb emu kill`, **verified** by watching the serial leave the device list; `forceKillEmulator` is the explicit, snapshot-destroying fallback
+- Tracking running emulator processes, and publishing each running AVD's serial onto `AvdInfo` so the tree can act on it
 - System image and device profile listing
+
+Deliberately carries no `vscode` import. Settings it needs (currently the guest-RAM toggle) are pushed in from `extension.ts`.
+
+**`src/avd/BootState.ts`** — Decides whether a guest is `offline`, `booting`, `ready`, or `wedged`. `classifyBoot()` is pure — no vscode, no adb, no fs — so the state machine is testable in isolation; `probeBootState()` is the thin adb layer that gathers `sys.boot_completed`, `init.svc.bootanim`, and a `pm path android` round trip. Never throws: a shell that refuses the call *is* the signal.
+
+**`src/avd/MemoryWatcher.ts`** — Samples host memory every 15 seconds while any emulator is running and warns once per emulator session when free memory crosses `caspian.emulator.lowMemoryFloorMb`. Complements `LaunchPreflight`, which only samples at launch and therefore cannot see a build starting afterwards. Started and stopped from `syncRunningAvds`.
 
 ### Views
 
-**`src/views/AvdTreeProvider.ts`** — `TreeDataProvider` for the "Virtual Devices" sidebar panel. Shows each AVD with its name, API level, and running status. Context menu items (play/stop/edit/delete) are driven by `contextValue` (`avd.running` / `avd.stopped`).
+**`src/views/AvdTreeProvider.ts`** — `TreeDataProvider` for the "Virtual Devices" sidebar panel. Shows each AVD with its name, API level, resolution, and running status. Context menu items (play/stop/edit/delete) are driven by `contextValue` (`avd.running` / `avd.stopped`), which is a **dot-suffixed composite matched by regex in `package.json`, never by equality** — health suffixes (`.brokenDisplay`, `.lowRam`) compose onto the base state, so adding one must never hide Launch/Stop/Delete.
 
 **`src/views/DeviceTreeProvider.ts`** — `TreeDataProvider` for the "Connected Devices" sidebar panel. Automatically updates when `DeviceTracker` emits `devicesChanged`. Shows device model, serial, and connection state with color-coded icons.
 
@@ -212,12 +221,33 @@ DeviceTracker (poll every 3s)
 
 ```
 User clicks Play on AVD
+  → runLaunchPreflight()  — host RAM, Gradle daemons, acceleration
   → AvdManager.launchEmulator(avdName)
-  → spawn(emulator, ['-avd', name], { detached: true })
+  → spawn(emulator, ['-avd', name], { detached: true, stdio: [ignore, fd, fd] })
   → Process unref'd (emulator runs independently)
-  → DeviceTracker detects new emulator-XXXX device
-  → syncRunningAvds() calls adb emu avd name
-  → AvdTreeProvider updates AVD status to "Running"
+  → Boot watch loop, every 2s until caspian.emulator.bootTimeoutSec:
+      ├─ readLaunchFailure()   — PANIC/ERROR in the captured log → fail fast
+      ├─ resolve serial once   — adb devices + adb emu avd name
+      └─ probeBootState()      — sys.boot_completed, init.svc.bootanim, pm path android
+           → classifyBoot() → offline | booting | ready | wedged
+  → ready:  refresh the tree, done
+  → wedged / timeout: open the launch log, offer Repair
+```
+
+Readiness is deliberately *not* `adb devices` reporting `state=device`: that is a
+console-port signal that fires long before Android is usable. The wedged state
+has a specific fingerprint — the boot animation stopped but `sys.boot_completed`
+was never set, or the package manager answers `Broken pipe`.
+
+### Emulator Stop Flow
+
+```
+Stop → AvdManager.stopEmulator(serial)
+  → adb -s <serial> emu kill
+  → poll adb devices until the serial disappears (10s)
+  → returns true (gone) / false (ignored the request)
+  → false → Repair offers a force kill, which states that killing qemu
+            leaves the snapshot corrupt, then marks the AVD for a cold boot
 ```
 
 ### Logcat Streaming

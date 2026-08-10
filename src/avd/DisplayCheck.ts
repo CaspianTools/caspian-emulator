@@ -1,4 +1,4 @@
-import { DISPLAY_RULES, DevicePreset, findPresetForAvd } from '../constants';
+import { DISPLAY_RULES, RAM_RULES, DevicePreset, findPresetForAvd } from '../constants';
 
 /**
  * Pure display analysis — no vscode, no fs, no adb. Everything it needs is
@@ -21,6 +21,7 @@ export type DisplayIssueKind =
   | 'aspect-unusual'
   | 'density-implausible'
   | 'ram-implausible'
+  | 'ram-below-floor'      // boots, but too little guest RAM for the system image
   | 'skin-conflict'        // skin.name / skin.path disagree with hw.lcd.*
   | 'runtime-override';    // adb wm size/density differs from config.ini
 
@@ -53,6 +54,10 @@ export interface DisplayReport {
   runtime?: RuntimeDisplay;
   /** hw.ramSize in MB, 0 when absent. */
   ramMb: number;
+  /** Minimum guest RAM for this system image, MB. 0 when the image is unknown. */
+  ramFloorMb: number;
+  /** No RAM-related issue — drives the sidebar's low-RAM badge. */
+  ramHealthy: boolean;
   issues: DisplayIssue[];
   /** No 'error'-severity issues. */
   healthy: boolean;
@@ -135,11 +140,41 @@ export function parseRamMb(raw: string | undefined): number {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
+/** True when the system image bundles Google Play services. */
+export function isGmsImage(tagId: string | undefined): boolean {
+  return /google_apis|google_ndk|play/i.test(tagId || '');
+}
+
+/**
+ * Minimum guest RAM for a system image, in MB.
+ *
+ * Google APIs/Play images from API 33 want appreciably more than the emulator's
+ * 1536 MB default: at 1536 MB an API 35 Play image boots, settles at around
+ * 100 MB free, and then ANRs SystemUI under any real load. Returns 0 when the
+ * image cannot be identified, so an unknown AVD is never flagged.
+ */
+export function guestRamFloorMb(apiLevel: number, tagId: string | undefined): number {
+  if (!apiLevel) { return 0; }
+  if (isGmsImage(tagId) && apiLevel >= RAM_RULES.GMS_MIN_API) { return RAM_RULES.GMS_MIN_RAM_MB; }
+  return RAM_RULES.AOSP_MIN_RAM_MB;
+}
+
+/** vm.heapSize to pair with a given hw.ramSize, clamped to sane bounds. */
+export function heapForRamMb(ramMb: number): number {
+  const raw = Math.round(ramMb * RAM_RULES.HEAP_FRACTION);
+  return Math.min(RAM_RULES.MAX_HEAP_MB, Math.max(RAM_RULES.MIN_HEAP_MB, raw));
+}
+
 export function analyzeDisplay(
   config: Record<string, string>,
   avdName: string,
   runtime?: RuntimeDisplay,
-  opts?: { strictPlayAspect?: boolean; skinPathExists?: (p: string) => boolean },
+  opts?: {
+    strictPlayAspect?: boolean;
+    skinPathExists?: (p: string) => boolean;
+    /** Set to enable the guest-RAM floor check; without it RAM is only bounds-checked. */
+    checkGuestRam?: boolean;
+  },
 ): DisplayReport {
   const issues: DisplayIssue[] = [];
 
@@ -219,11 +254,23 @@ export function analyzeDisplay(
     }
   }
 
+  // apiLevel and the image tag are both in config.ini, so the RAM floor stays
+  // a pure function of the file rather than needing a caller to look them up.
+  const apiLevel = parseInt(config['image.sysdir.1']?.match(/android-(\d+)/)?.[1] || '0', 10);
+  const ramFloorMb = guestRamFloorMb(apiLevel, config['tag.id']);
+
   if (ramMb && ramMb <= DISPLAY_RULES.AOSP_FALLBACK_RAM_MB) {
     issues.push({
       kind: 'ram-implausible',
       severity: 'error',
       message: `Only ${ramMb} MB of RAM is configured — Android cannot finish booting and will appear to hang.`,
+    });
+  } else if (opts?.checkGuestRam && ramMb && ramFloorMb && ramMb < ramFloorMb) {
+    issues.push({
+      kind: 'ram-below-floor',
+      severity: 'warning',
+      message: `${ramMb} MB of RAM is below the ${ramFloorMb} MB an API ${apiLevel} `
+        + `${isGmsImage(config['tag.id']) ? 'Google APIs' : 'AOSP'} image needs — it will boot, then swap and stop responding under load.`,
     });
   }
 
@@ -269,6 +316,8 @@ export function analyzeDisplay(
     config: spec,
     runtime,
     ramMb,
+    ramFloorMb,
+    ramHealthy: !issues.some(i => i.kind === 'ram-implausible' || i.kind === 'ram-below-floor'),
     issues,
     healthy: !issues.some(i => i.severity === 'error'),
     summary,
@@ -283,7 +332,8 @@ export function analyzeDisplay(
 export function formatDisplayReport(report: DisplayReport): string {
   const lines: string[] = [`Display check — ${report.avdName}`];
   lines.push(`  Configured: ${report.summary}`);
-  lines.push(`  RAM: ${report.ramMb ? `${report.ramMb} MB` : 'not set (emulator default)'}`);
+  lines.push(`  RAM: ${report.ramMb ? `${report.ramMb} MB` : 'not set (emulator default)'}`
+    + (report.ramFloorMb ? ` (floor for this image: ${report.ramFloorMb} MB)` : ''));
   if (report.runtime) {
     const r = report.runtime;
     if (r.size) { lines.push(`  Runtime physical size: ${r.size.w}×${r.size.h}`); }

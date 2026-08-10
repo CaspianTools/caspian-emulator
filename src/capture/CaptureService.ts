@@ -9,6 +9,8 @@ import {
   CaptureCancelledError,
   Orientation,
   RotationSnapshot,
+  StableFrame,
+  expectedOrientation,
   lockRotation,
   restoreRotation,
   snapshotRotation,
@@ -21,6 +23,11 @@ import {
 } from './CapturePaths';
 import { DemoModeController } from './DemoMode';
 import { Logger } from '../utils/Logger';
+
+/** Smallest-width in dp at which the Pixel launcher permits landscape. */
+const TABLET_SW_DP = 600;
+/** Never drop below this density; the UI becomes unusably small and unrealistic. */
+const TABLET_MIN_DENSITY = 160;
 
 export interface AssetValidation {
   level: 'pass' | 'warn' | 'fail';
@@ -85,6 +92,8 @@ export interface CaptureCellContext {
   fontScale?: number;
   density?: number;
   token?: CancellationLike;
+  /** Orientation this rotation should produce, so a silent no-op is caught. */
+  expect?: Orientation;
 }
 
 export class CaptureService {
@@ -100,6 +109,93 @@ export class CaptureService {
       .get<number>(CONFIG.CAPTURE_SETTLE_DELAY, 500);
   }
 
+  private tabletTrickEnabled(): boolean {
+    return vscode.workspace.getConfiguration(CONFIG.SECTION)
+      .get<boolean>(CONFIG.CAPTURE_TABLET_TRICK, false);
+  }
+
+  /**
+   * Coax a landscape shot out of a launcher that refuses to rotate.
+   *
+   * The Pixel launcher only allows landscape at sw600dp or wider, and
+   * `wm set-ignore-orientation-request` is itself ignored below that threshold —
+   * so the only lever left is density: dp = px / (dpi / 160), which means a
+   * lower density makes the same panel measure wider in dp. Home-screen and
+   * widget shots are otherwise impossible on a phone profile.
+   *
+   * Returns the frame plus the density used, so the caller can disclose it.
+   * The density is always restored, including on failure.
+   */
+  private async captureWithTabletDensity(
+    serial: string,
+    expect: Orientation,
+    token?: CancellationLike,
+  ): Promise<{ frame: StableFrame; density: number } | undefined> {
+    let priorOverride: number | undefined;
+    let physical: number | undefined;
+    try {
+      const d = await this.adb.getWmDensity(serial);
+      priorOverride = d.override;
+      physical = d.override ?? d.physical;
+    } catch (err) {
+      Logger.warn(`Could not read density on ${serial}: ${err}`);
+      return undefined;
+    }
+    if (!physical) { return undefined; }
+
+    // Current screen size in px, to work out the density that reaches sw600dp.
+    let shortPx: number;
+    try {
+      const size = await this.adb.getWmSize(serial);
+      const s = size.override ?? size.physical;
+      if (!s) { return undefined; }
+      shortPx = Math.min(s.w, s.h);
+    } catch {
+      return undefined;
+    }
+
+    const target = Math.floor((shortPx * 160) / TABLET_SW_DP);
+    if (target >= physical) { return undefined; }   // already wide enough in dp
+    const density = Math.max(TABLET_MIN_DENSITY, target);
+    if (density >= physical) { return undefined; }
+
+    try {
+      await this.adb.setWmDensity(serial, density);
+      const frame = await waitForStableScreen(this.adb, serial, {
+        tailMs: this.settleDelay(),
+        token,
+        expectOrientation: expect,
+      });
+      if (frame.orientation !== expect) { return undefined; }
+      return { frame, density };
+    } catch (err) {
+      Logger.warn(`Tablet-density landscape attempt failed on ${serial}: ${err}`);
+      return undefined;
+    } finally {
+      try {
+        if (priorOverride !== undefined) {
+          await this.adb.setWmDensity(serial, priorOverride);
+        } else {
+          await this.adb.resetWmDensity(serial);
+        }
+      } catch (err) {
+        Logger.warn(`Could not restore density on ${serial}: ${err}`);
+      }
+    }
+  }
+
+  /**
+   * Measure which way up the device natively is.
+   *
+   * Rotation 0 is by definition the natural orientation, so one locked capture
+   * answers it. Tablets and foldables are naturally landscape.
+   */
+  async detectNaturalOrientation(serial: string, token?: CancellationLike): Promise<Orientation> {
+    await lockRotation(this.adb, serial, 0);
+    const frame = await waitForStableScreen(this.adb, serial, { tailMs: this.settleDelay(), token });
+    return frame.orientation;
+  }
+
   /**
    * Capture one orientation and write it to disk.
    *
@@ -107,6 +203,10 @@ export class CaptureService {
    * from the rotation constant we wrote: user_rotation is relative to the
    * device's *natural* orientation, which is landscape on tablets and many
    * foldables, so rotation 0 is not reliably portrait.
+   *
+   * When ctx.expect is set, a mismatch is a hard validation failure rather than
+   * a quietly relabelled file — a landscape shot that silently stayed portrait
+   * is exactly the kind of wrong output that looks fine.
    */
   async captureCell(
     serial: string,
@@ -115,10 +215,22 @@ export class CaptureService {
   ): Promise<CaptureResult> {
     await lockRotation(this.adb, serial, rotation);
 
-    const frame = await waitForStableScreen(this.adb, serial, {
+    let frame = await waitForStableScreen(this.adb, serial, {
       tailMs: this.settleDelay(),
       token: ctx.token,
+      expectOrientation: ctx.expect,
     });
+
+    // The launcher will not go landscape on a phone-sized display. Opt-in only,
+    // because the resulting shot is taken at a density the device does not have.
+    let trickDensity: number | undefined;
+    if (ctx.expect && frame.orientation !== ctx.expect && this.tabletTrickEnabled()) {
+      const retry = await this.captureWithTabletDensity(serial, ctx.expect, ctx.token);
+      if (retry) {
+        frame = retry.frame;
+        trickDensity = retry.density;
+      }
+    }
 
     const dir = resolveLocaleDirectory(ctx.runDir, ctx.locale);
     const fileName = buildCaptureFileName({
@@ -133,6 +245,24 @@ export class CaptureService {
 
     const validation = validatePlayAsset(frame.width, frame.height, this.maxAspectRatio());
     const warnings = frame.warning ? [frame.warning] : [];
+
+    if (ctx.expect && frame.orientation !== ctx.expect) {
+      const message = `Requested ${ctx.expect} but the screen stayed ${frame.orientation} `
+        + '— the app or launcher refused to rotate, so this image is not the orientation it is named for.';
+      warnings.push(message);
+      validation.issues.push(message);
+      validation.level = 'fail';
+      Logger.warn(`${file}: ${message}`);
+    }
+
+    if (trickDensity !== undefined) {
+      // Disclosed, never silent: this shot is not at the device's own density,
+      // so it must not be passed off as representative.
+      warnings.push(
+        `Captured at ${trickDensity} dpi instead of the device's own density, because the launcher `
+        + 'only allows landscape on a tablet-sized display. Layout is real; scale is not.',
+      );
+    }
 
     Logger.info(`Captured ${file} (${frame.width}×${frame.height}, ${validation.level}).`);
 
@@ -185,6 +315,11 @@ export class CaptureService {
 
       const seen = new Set<Orientation>();
       const rotations: Array<0 | 1> = [0, 1];
+      // Rotation 0 defines this device's natural orientation; rotation 1 must
+      // then produce the opposite. Without that expectation a shot that never
+      // rotated is silently filed under the orientation it happens to measure.
+      let natural: Orientation | undefined;
+
       for (let i = 0; i < rotations.length; i++) {
         if (options.token?.isCancellationRequested) { throw new CaptureCancelledError(); }
         options.progress?.report({
@@ -192,12 +327,15 @@ export class CaptureService {
           increment: 100 / rotations.length,
         });
 
-        const result = await this.captureCell(serial, rotations[i], {
+        const rotation = rotations[i];
+        const result = await this.captureCell(serial, rotation, {
           runDir,
           deviceLabel,
           index: results.length + 1,
           token: options.token,
+          expect: natural ? expectedOrientation(natural, rotation) : undefined,
         });
+        if (natural === undefined) { natural = result.orientation; }
 
         if (seen.has(result.orientation)) {
           try { fs.unlinkSync(result.file); } catch { /* ignore */ }

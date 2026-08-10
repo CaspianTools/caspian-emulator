@@ -2,7 +2,7 @@
   "name": "caspian-emulator",
   "displayName": "Caspian Emulator",
   "description": "Android emulator management for VS Code — no Android Studio required. AVD control, store screenshot capture, locale and accessibility sweeps, embedded screen, ADB tools, logcat viewer, and automatic SDK setup.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "publisher": "CaspianTools",
   "license": "MIT",
   "engines": {
@@ -136,6 +136,30 @@
           "default": true,
           "description": "Capture emulator output to a log file so startup failures can be reported instead of appearing as a hang."
         },
+        "caspian.emulator.bootTimeoutSec": {
+          "type": "number",
+          "default": 180,
+          "minimum": 30,
+          "maximum": 900,
+          "description": "How long to wait for Android to finish booting before reporting the emulator as stalled (seconds). A cold boot after a data wipe can take several minutes."
+        },
+        "caspian.emulator.watchHostMemory": {
+          "type": "boolean",
+          "default": true,
+          "description": "Warn when free host memory runs low while an emulator is running, for example when a build starts alongside it."
+        },
+        "caspian.emulator.lowMemoryFloorMb": {
+          "type": "number",
+          "default": 512,
+          "minimum": 0,
+          "maximum": 16384,
+          "description": "Free host memory in megabytes below which the running-emulator warning fires. Set to 0 to disable."
+        },
+        "caspian.avd.checkGuestRam": {
+          "type": "boolean",
+          "default": true,
+          "description": "Flag virtual devices configured with less RAM than their system image needs. Modern Google APIs images swap and stop responding below 2560 MB."
+        },
         "caspian.avd.playStoreStrictAspect": {
           "type": "boolean",
           "default": false,
@@ -188,6 +212,16 @@
           },
           "default": [],
           "description": "Locale tags offered when running the locale and accessibility matrix, for example en-US or ar."
+        },
+        "caspian.capture.tabletTrickForLandscape": {
+          "type": "boolean",
+          "default": false,
+          "description": "When a landscape capture will not rotate, temporarily lower the display density so the launcher treats the device as a tablet. Captures taken this way are marked in the report, because the density is not the device's own."
+        },
+        "caspian.capture.detectLeftoverOverrides": {
+          "type": "boolean",
+          "default": true,
+          "description": "Check connecting devices for display, rotation, or screenshot-mode overrides left behind by an interrupted capture run, and offer to clear them."
         },
         "caspian.demoMode.clock": {
           "type": "string",
@@ -438,9 +472,15 @@
       },
       {
         "command": "caspian.checkAvdDisplay",
-        "title": "Check Display Configuration",
+        "title": "Check Device Configuration",
         "category": "Caspian",
         "icon": "$(screen-full)"
+      },
+      {
+        "command": "caspian.repairAvd",
+        "title": "Repair Virtual Device",
+        "category": "Caspian",
+        "icon": "$(tools)"
       },
       {
         "command": "caspian.checkAcceleration",
@@ -483,6 +523,18 @@
         "title": "Reset Device Display & Language Overrides",
         "category": "Caspian",
         "icon": "$(debug-restart)"
+      },
+      {
+        "command": "caspian.setDisplayCutout",
+        "title": "Set Display Cutout (Notch)",
+        "category": "Caspian",
+        "icon": "$(primitive-square)"
+      },
+      {
+        "command": "caspian.setNavigationMode",
+        "title": "Set Navigation Mode",
+        "category": "Caspian",
+        "icon": "$(layout-panel)"
       }
     ],
     "viewsContainers": {
@@ -665,13 +717,23 @@
         },
         {
           "command": "caspian.checkAvdDisplay",
-          "when": "view == caspian.avdList && viewItem =~ /brokenDisplay/",
+          "when": "view == caspian.avdList && viewItem =~ /brokenDisplay|lowRam/",
           "group": "inline"
         },
         {
           "command": "caspian.checkAvdDisplay",
           "when": "view == caspian.avdList",
           "group": "1_edit"
+        },
+        {
+          "command": "caspian.repairAvd",
+          "when": "view == caspian.avdList && viewItem =~ /^avd\\.running/",
+          "group": "inline"
+        },
+        {
+          "command": "caspian.repairAvd",
+          "when": "view == caspian.avdList",
+          "group": "3_diagnostics"
         },
         {
           "command": "caspian.showEmulatorLog",
@@ -690,6 +752,16 @@
         },
         {
           "command": "caspian.toggleDemoMode",
+          "when": "view == caspian.deviceList && viewItem =~ /^device\\.(emulator|physical)$/",
+          "group": "3_capture"
+        },
+        {
+          "command": "caspian.setDisplayCutout",
+          "when": "view == caspian.deviceList && viewItem =~ /^device\\.(emulator|physical)$/",
+          "group": "3_capture"
+        },
+        {
+          "command": "caspian.setNavigationMode",
           "when": "view == caspian.deviceList && viewItem =~ /^device\\.(emulator|physical)$/",
           "group": "3_capture"
         },

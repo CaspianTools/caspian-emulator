@@ -66,32 +66,42 @@ export class DeviceTracker extends EventEmitter {
         newMap.set(d.serial, d);
       }
 
-      // Detect changes
+      // Diff first, publish the new map, then emit.
+      //
+      // EventEmitter.emit is synchronous, so a handler that calls getDevices()
+      // runs before any assignment made after the emit. Emitting first meant
+      // handlers saw a device list that did not yet contain the very device
+      // whose connection woke them — checkPendingRestores filtered its own
+      // trigger out and never prompted.
+      const previous = this.currentDevices;
+      const connected: DeviceInfo[] = [];
+      const disconnected: DeviceInfo[] = [];
       let changed = false;
 
-      // New/changed devices
       for (const [serial, device] of newMap) {
-        const existing = this.currentDevices.get(serial);
+        const existing = previous.get(serial);
         if (!existing) {
           changed = true;
           Logger.info(`Device connected: ${device.model} (${serial}) [${device.state}]`);
-          this.emit('deviceConnected', device);
+          connected.push(device);
         } else if (existing.state !== device.state) {
           changed = true;
           Logger.info(`Device state changed: ${serial} ${existing.state} → ${device.state}`);
         }
       }
 
-      // Removed devices
-      for (const [serial, device] of this.currentDevices) {
+      for (const [serial, device] of previous) {
         if (!newMap.has(serial)) {
           changed = true;
           Logger.info(`Device disconnected: ${device.model} (${serial})`);
-          this.emit('deviceDisconnected', device);
+          disconnected.push(device);
         }
       }
 
       this.currentDevices = newMap;
+
+      for (const device of connected) { this.emit('deviceConnected', device); }
+      for (const device of disconnected) { this.emit('deviceDisconnected', device); }
 
       if (changed) {
         this.emit('devicesChanged', devices);

@@ -6,6 +6,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import { Logger } from '../utils/Logger';
 import { analyzeDisplay } from './DisplayCheck';
+import { BOOT_WATCH } from '../constants';
 
 export interface UpdateConfigOptions {
   /** false = only write keys that are absent from the file. Default true. */
@@ -17,9 +18,19 @@ export interface UpdateConfigOptions {
 export class AvdManager {
   private sdk: SdkInfo;
   private runningEmulators: Map<string, EmulatorProcess> = new Map();
+  /**
+   * Injected rather than read from workspace config, so this module stays free
+   * of `vscode` and the display analysis stays a pure function of config.ini.
+   */
+  private checkGuestRam = true;
 
   constructor(sdk: SdkInfo) {
     this.sdk = sdk;
+  }
+
+  /** Mirror of caspian.avd.checkGuestRam; extension.ts keeps this in sync. */
+  setCheckGuestRam(enabled: boolean): void {
+    this.checkGuestRam = enabled;
   }
 
   /**
@@ -123,11 +134,14 @@ export class AvdManager {
         sdcard: '',
         path: avdDir,
         running: this.runningEmulators.has(name),
+        serial: this.runningEmulators.get(name)?.serial || undefined,
         lcdWidth: 0,
         lcdHeight: 0,
         lcdDensity: 0,
         ramMb: 0,
         displayHealthy: false,
+        ramHealthy: true,
+        ramFloorMb: 0,
         displaySummary: 'no config.ini',
         displayProblem: 'config.ini is missing for this AVD.',
       };
@@ -136,7 +150,7 @@ export class AvdManager {
     const config = this.parseIniFile(configPath);
     // Config-only analysis: no adb, so listAvds() stays cheap enough to run on
     // every tree refresh.
-    const report = analyzeDisplay(config, name);
+    const report = analyzeDisplay(config, name, undefined, { checkGuestRam: this.checkGuestRam });
     const firstError = report.issues.find(i => i.severity === 'error')
       || report.issues.find(i => i.severity === 'warning');
 
@@ -151,11 +165,16 @@ export class AvdManager {
       sdcard: config['sdcard.size'] || '',
       path: avdDir,
       running: this.runningEmulators.has(name),
+      // Read straight off the running map, so the serial survives listAvds()
+      // rebuilding every AvdInfo — without this the Stop command has no serial.
+      serial: this.runningEmulators.get(name)?.serial || undefined,
       lcdWidth: report.config?.width || 0,
       lcdHeight: report.config?.height || 0,
       lcdDensity: report.config?.density || 0,
       ramMb: report.ramMb,
       displayHealthy: report.healthy,
+      ramHealthy: report.ramHealthy,
+      ramFloorMb: report.ramFloorMb,
       displaySummary: report.config ? `${report.config.width}×${report.config.height}` : 'no display config',
       displayProblem: firstError?.message,
     };
@@ -600,14 +619,70 @@ export class AvdManager {
     return undefined;
   }
 
-  /** Stop a running emulator via adb */
-  async stopEmulator(serial: string): Promise<void> {
-    return new Promise((resolve, reject) => {
+  /**
+   * Stop a running emulator with `adb emu kill` and confirm it actually went.
+   *
+   * `adb emu kill` returning OK only means the console accepted the command —
+   * a wedged guest can acknowledge it and keep running. Callers need to know
+   * the difference, because the remedy (force-killing qemu) costs the snapshot.
+   *
+   * Returns true when the device left the device list within verifyMs.
+   */
+  async stopEmulator(serial: string, opts: { verifyMs?: number } = {}): Promise<boolean> {
+    await new Promise<void>((resolve, reject) => {
       execFile(this.sdk.adbPath, ['-s', serial, 'emu', 'kill'], (err) => {
         if (err) { reject(err); }
         else { resolve(); }
       });
     });
+
+    const verifyMs = opts.verifyMs ?? BOOT_WATCH.STOP_VERIFY_MS;
+    const deadline = Date.now() + verifyMs;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, BOOT_WATCH.STOP_POLL_MS));
+      if (!(await this.isSerialPresent(serial))) {
+        for (const [name, proc] of this.runningEmulators) {
+          if (proc.serial === serial) { this.runningEmulators.delete(name); }
+        }
+        Logger.info(`Emulator ${serial} stopped.`);
+        return true;
+      }
+    }
+    Logger.warn(`Emulator ${serial} did not stop within ${verifyMs}ms of "adb emu kill".`);
+    return false;
+  }
+
+  /** True when adb still lists this serial at all, in any state. */
+  private async isSerialPresent(serial: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      execFile(this.sdk.adbPath, ['devices'], (err, stdout) => {
+        if (err) { resolve(false); return; }
+        resolve(stdout.split('\n').slice(1).some(l => l.trim().startsWith(serial)));
+      });
+    });
+  }
+
+  /**
+   * Kill the emulator's own process, for a guest that ignored `adb emu kill`.
+   *
+   * This is the expensive rung: qemu never flushes, so the saved snapshot is
+   * left corrupt and the next start must be a cold boot. Callers must say so
+   * before calling this.
+   */
+  async forceKillEmulator(avdName: string): Promise<boolean> {
+    const proc = this.runningEmulators.get(avdName);
+    if (proc?.process && proc.process.exitCode === null) {
+      try {
+        proc.process.kill();
+        this.runningEmulators.delete(avdName);
+        Logger.warn(`Force-killed the emulator process for ${avdName}; its snapshot is now unusable.`);
+        return true;
+      } catch (err) {
+        Logger.warn(`Could not force-kill ${avdName}: ${err}`);
+      }
+    }
+    // Launched outside this session (detached + unref'd), so there is no handle.
+    return false;
   }
 
   /** Check if an AVD is currently running */
@@ -633,6 +708,22 @@ export class AvdManager {
   /** Mark AVD as stopped */
   markStopped(avdName: string): void {
     this.runningEmulators.delete(avdName);
+  }
+
+  /**
+   * Drop tracked emulators that adb no longer reports.
+   *
+   * Entries whose spawned process is still alive are kept: an emulator we just
+   * launched is tracked seconds before it appears in `adb devices`, and
+   * forgetting it there would throw away the handle a force-kill needs.
+   */
+  reconcileRunning(liveAvdNames: Set<string>): void {
+    for (const [name, proc] of [...this.runningEmulators]) {
+      if (liveAvdNames.has(name)) { continue; }
+      if (proc.process && proc.process.exitCode === null) { continue; }
+      this.runningEmulators.delete(name);
+      Logger.debug(`Emulator ${name} is no longer running.`);
+    }
   }
 
   /** Clone an AVD by copying its directory and creating a new .ini reference */

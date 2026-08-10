@@ -2,6 +2,37 @@
 
 All notable changes to Caspian Emulator will be documented in this file.
 
+## [1.2.0] - 2026-08-11
+
+### Added
+- **Real boot detection** — launching an emulator now waits for Android itself, not for `adb devices`. Readiness means `sys.boot_completed` is set *and* a package-manager round trip succeeds; the notification says which of "waiting for the device", "Android is booting", or "boot stalled" you are in. Previously the extension declared success the moment the emulator's console port answered, which happens long before the guest is usable
+- **A stalled boot is reported instead of timing out in silence** — a guest that finishes its boot animation but never sets `sys.boot_completed`, or whose shell answers `Broken pipe`, is detected as wedged. The captured launch log opens automatically rather than waiting for you to find "Show Emulator Launch Log", and the message offers Repair. The wait is now configurable and defaults to 180 seconds, because a cold boot after a data wipe takes longer than the old 60-second cap
+- **Repair Virtual Device** — an escalating ladder for an emulator that will not start or will not stop: stop cleanly, cold boot, or wipe data. Each rung states its cost up front, and the wipe spells out that it destroys app data and any placed home-screen widgets
+- **Stopping is verified** — `adb emu kill` is confirmed by watching the device leave the device list. If the emulator ignores it, Caspian offers a force kill and says plainly that this corrupts the saved snapshot, then automatically cold boots that AVD next time so the bad snapshot is never loaded
+- **Guest RAM check** — a virtual device configured with less RAM than its system image needs is flagged in the sidebar with a one-click fix. An API 33+ Google APIs image needs 2560 MB; at the emulator's 1536 MB default it boots, then swaps and ANRs ("System UI isn't responding") under any real load. This is distinct from the existing host-memory check, which asks whether your machine can spare the RAM, not whether the amount is enough
+- **Host memory is watched while the emulator runs**, not only sampled at launch — the common failure on a 16 GB machine is a build starting *after* a successful launch. One warning fires when free memory crosses a floor, naming the process responsible, with the same one-click "Stop Gradle Daemons" remedy. The pre-flight now offers that remedy at the "memory is tight" tier too, not only at "not enough memory"
+- **Display cutout emulation** — switch a running device between corner, double, punch-hole, tall, and waterfall notches, or none. Verifies the change by reading the overlay state back
+- **Navigation mode emulation** — switch between gesture, 2-button, and 3-button navigation. Together with cutouts these are what edge-to-edge layout work needs, and Android 15's edge-to-edge enforcement makes it a recurring need for every Compose app
+- **Landscape home-screen captures** (opt-in, `caspian.capture.tabletTrickForLandscape`) — the Pixel launcher refuses to rotate on a phone profile and ignores `wm set-ignore-orientation-request` below sw600dp, so the only lever is density. When enabled, a landscape shot that will not rotate is retried at a lower density and the report records that the shot is not at the device's own density
+- **Leftover overrides are detected on connect** — a device still carrying a display, rotation, or screenshot-mode override from an interrupted run is now spotted by probing the device, and Caspian offers to clear it. Previously only overrides this extension had recorded could be recovered
+- 6 new settings covering the boot timeout, the memory watch and its floor, the guest-RAM check, the landscape density trick, and leftover detection
+
+### Fixed
+- **Stop on a virtual device never worked** — `AvdInfo.serial` was declared but never populated, so "Stop" always failed with "Cannot determine emulator serial". The serial is now read from the running-emulator map, and falls back to asking adb for emulators started before the window opened
+- **A rotation that silently did not happen is now a validation failure** — capture already had the check but nothing ever enabled it, so a landscape shot that stayed portrait was filed under the orientation it happened to measure, with no warning. This is the kind of wrong output that looks fine
+- **Tablet and foldable captures were labelled against the wrong axis** — `user_rotation` is relative to the device's *natural* orientation, which is landscape on tablets, so mapping portrait to rotation 0 was wrong for them. The natural orientation is now measured once per run
+- **Screenshot mode is re-applied after a display density change** — a density change restarts SystemUI and dropped demo mode part-way, leaving a status bar with duplicated icons (two Wi-Fi glyphs, two data labels)
+- **A clean status bar is actually clean** — the Wi-Fi glyph no longer carries a "!" (the link is now marked validated) and the "3G" data label is gone (`datatype none` is handled explicitly, where the documented `datatype false` fell through to a visible label on several images)
+- **The connect-time restore prompt never fired for the device that triggered it** — the device tracker emitted `deviceConnected` before publishing the updated device list, and since `emit` is synchronous the handler saw a list that did not yet contain that device
+- **Store screenshot capture had no crash recovery** — unlike the matrix run it never wrote a pending-restore record, so a crash mid-run left rotation pinned and screenshot mode on with nothing to recover from
+- **Custom virtual devices were created with no RAM setting at all** — the preset flow writes `hw.ramSize`, but the custom system-image flow passed no hardware, leaving the emulator's 1536 MB default. It now writes the floor for the chosen image
+
+### Changed
+- **"Check Display Configuration" is now "Check Device Configuration"** — it covers RAM as well as the display. The command id is unchanged
+- **Cutout and navigation-bar overlays join the restore machinery** — they are snapshotted, restored, and cleared by "Reset Device Display & Language Overrides"
+- **Watching a boot can be cancelled** without stopping the emulator
+
+
 ## [1.1.0] - 2026-08-10
 
 ### Fixed

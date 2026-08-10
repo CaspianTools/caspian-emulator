@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import { AdbClient } from '../adb/AdbClient';
 import { DemoModeController, DEMO_ACTION } from './DemoMode';
+import { SystemUiOverlayController } from './SystemUiOverlay';
+import { CUTOUT_MODES, NAVBAR_MODES } from '../constants';
 import { Logger } from '../utils/Logger';
 
 /**
@@ -33,6 +35,10 @@ export interface DeviceStateSnapshot {
   demoModeEntered: boolean;
   /** package → prior locale tags ([] means "followed the system default"). */
   appLocales: Record<string, string[]>;
+  /** Cutout emulation mode id in force before the run ('none' when off). */
+  cutoutMode?: string;
+  /** Navigation-bar mode id in force before the run. */
+  navbarMode?: string;
 }
 
 export interface SnapshotDimensions {
@@ -41,6 +47,7 @@ export interface SnapshotDimensions {
   density?: boolean;
   rtl?: boolean;
   demo?: boolean;
+  overlays?: boolean;
   packages?: string[];
 }
 
@@ -104,6 +111,11 @@ export class DeviceStateManager {
       await read('sysui_demo_allowed', async () => {
         snap.sysuiDemoAllowed = await this.adb.getSetting(serial, 'global', 'sysui_demo_allowed');
       });
+    }
+    if (dims.overlays) {
+      const overlays = new SystemUiOverlayController(this.adb);
+      await read('cutout overlay', async () => { snap.cutoutMode = await overlays.current(serial, 'cutout'); });
+      await read('navbar overlay', async () => { snap.navbarMode = await overlays.current(serial, 'navbar'); });
     }
     for (const pkg of dims.packages || []) {
       await read(`app locales for ${pkg}`, async () => {
@@ -187,6 +199,20 @@ export class DeviceStateManager {
 
     await step('demo mode setting', () => this.restoreSetting(serial, 'global', 'sysui_demo_allowed', snap.sysuiDemoAllowed));
 
+    if (snap.cutoutMode !== undefined || snap.navbarMode !== undefined) {
+      const overlays = new SystemUiOverlayController(this.adb);
+      if (snap.cutoutMode !== undefined) {
+        await step('display cutout', async () => {
+          await overlays.apply(serial, 'cutout', CUTOUT_MODES.find(m => m.id === snap.cutoutMode)?.pkg);
+        });
+      }
+      if (snap.navbarMode !== undefined) {
+        await step('navigation mode', async () => {
+          await overlays.apply(serial, 'navbar', NAVBAR_MODES.find(m => m.id === snap.navbarMode)?.pkg);
+        });
+      }
+    }
+
     return failures;
   }
 
@@ -227,8 +253,46 @@ export class DeviceStateManager {
       DemoModeController.forget(serial);
     });
     await step('demo mode setting', () => this.adb.deleteSetting(serial, 'global', 'sysui_demo_allowed'));
+    await step('cutout and navigation overlays', () => new SystemUiOverlayController(this.adb).resetAll(serial));
 
     await this.clearPending(serial);
     return failures;
+  }
+
+  /**
+   * Probe a device for overrides left behind by a run this session knows
+   * nothing about — a crash that lost globalState, a different machine, or an
+   * older build. Read-only; returns human-readable descriptions.
+   */
+  async detectLeftoverOverrides(serial: string): Promise<string[]> {
+    const found: string[] = [];
+
+    try {
+      const density = await this.adb.getWmDensity(serial);
+      if (density.override !== undefined && density.override !== density.physical) {
+        found.push(`a display density override of ${density.override} dpi`);
+      }
+    } catch { /* device busy or still booting — not a leftover signal */ }
+
+    try {
+      const size = await this.adb.getWmSize(serial);
+      if (size.override && (size.override.w !== size.physical?.w || size.override.h !== size.physical?.h)) {
+        found.push(`a display size override of ${size.override.w}×${size.override.h}`);
+      }
+    } catch { /* ignore */ }
+
+    try {
+      const auto = await this.adb.getSetting(serial, 'system', 'accelerometer_rotation');
+      const user = await this.adb.getSetting(serial, 'system', 'user_rotation');
+      if (auto === '0' && user !== null) { found.push('a locked screen rotation'); }
+    } catch { /* ignore */ }
+
+    try {
+      if (await this.adb.getSetting(serial, 'global', 'sysui_demo_allowed') === '1') {
+        found.push('screenshot (demo) mode still enabled');
+      }
+    } catch { /* ignore */ }
+
+    return found;
   }
 }

@@ -53,10 +53,12 @@ code --install-extension CaspianTools.caspian-emulator
 | Clean status bar for screenshots | Right-click a device → **Toggle Screenshot Mode** |
 | Capture store screenshots | Right-click a device → **Capture Store Screenshots** |
 | Test languages and font sizes | Right-click a device → **Run Locale & Accessibility Matrix** |
-| Fix a wrong-sized virtual device | Right-click an AVD → **Check Display Configuration** |
+| Fix a wrong-sized or under-provisioned virtual device | Right-click an AVD → **Check Device Configuration** |
+| Unstick an emulator that won't start or stop | Right-click an AVD → **Repair Virtual Device** |
+| Test a notch or gesture navigation | Right-click a device → **Set Display Cutout** / **Set Navigation Mode** |
 
 ## Next Steps
 
 - See [Setup Guide](SETUP_GUIDE.md) for advanced configuration and troubleshooting
 - See [Architecture](ARCHITECTURE.md) to understand the codebase
-- See the [Wiki](https://github.com/Caspian-Explorer/caspian-emulator/wiki) for feature guides and FAQ
+- See [Discussions](https://github.com/Caspian-Explorer/caspian-emulator/discussions) for release notes and feature announcements

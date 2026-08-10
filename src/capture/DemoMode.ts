@@ -17,13 +17,13 @@ export const DEMO_ACTION = 'com.android.systemui.demo';
 const DEMO_ALLOWED_KEY = 'sysui_demo_allowed';
 
 /**
- * `datatype false` is verbatim from Google's own documented snippet. In AOSP's
- * MobileSignalController the value is matched against a fixed set (1x, 3g, 4g,
- * lte, dis, null, …) and anything unrecognised falls through to UNKNOWN, which
- * renders as nothing — which is why the documented snippet appears to work.
- * `null` is the explicitly-handled alternative if a stray icon ever shows up.
+ * Google's documented snippet uses `datatype false`, relying on AOSP's
+ * MobileSignalController falling through to UNKNOWN for any unrecognised value.
+ * That fall-through is not universal: on several Google API images it renders a
+ * "3G" label next to the bars. `none` is handled explicitly and reliably draws
+ * nothing, which is what a store screenshot wants.
  */
-const DEFAULT_DATA_TYPE = 'false';
+const DEFAULT_DATA_TYPE = 'none';
 
 /** Icons hidden by the `status` command to clear the right side of the bar. */
 const STATUS_ICONS = [
@@ -110,7 +110,9 @@ export class DemoModeController {
     await send([['command', 'clock'], ['hhmm', opts.clock]]);
     await send([['command', 'battery'], ['level', String(opts.batteryLevel)], ['plugged', 'false']]);
     await send([['command', 'network'], ['mobile', 'show'], ['level', String(opts.signalLevel)], ['datatype', opts.dataType]]);
-    await send([['command', 'network'], ['wifi', 'show'], ['level', String(opts.signalLevel)]]);
+    // `fully true` marks the Wi-Fi link as validated; without it SystemUI draws
+    // the "no internet" exclamation mark over the glyph.
+    await send([['command', 'network'], ['wifi', 'show'], ['level', String(opts.signalLevel)], ['fully', 'true']]);
     await send([['command', 'network'], ['airplane', 'hide']]);
 
     if (opts.hideStatusIcons) {
@@ -147,6 +149,26 @@ export class DemoModeController {
       DemoModeController.onChange.fire();
       Logger.info(`Demo mode exited on ${serial}.`);
     }
+  }
+
+  /**
+   * Re-send the demo commands after something restarted SystemUI.
+   *
+   * `wm density` and `wm size` re-inflate the status bar, which drops demo
+   * state part-way: the observed result is a bar with duplicated icons (two
+   * Wi-Fi glyphs, two data labels). Exiting first clears the stale views, so
+   * this is exit-then-enter rather than a plain re-send.
+   */
+  async reapply(serial: string): Promise<void> {
+    if (!DemoModeController.isActive(serial)) { return; }
+    const entry = DemoModeController.active.get(serial);
+    await this.adb.broadcast(serial, DEMO_ACTION, [['command', 'exit']]);
+    // Keep the recorded prior value: enter() reuses it rather than reading back
+    // the '1' we just wrote, which would otherwise become the "restore" target.
+    DemoModeController.active.delete(serial);
+    if (entry) { DemoModeController.active.set(serial, entry); }
+    await this.enter(serial);
+    Logger.info(`Demo mode re-applied on ${serial} after a configuration change.`);
   }
 
   /** Toggle demo mode; returns the new state. */

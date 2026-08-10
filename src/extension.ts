@@ -2,15 +2,35 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
-import { COMMANDS, VIEWS, CONFIG, DEVICE_PRESETS, DISPLAY_RULES, getDefaultAbi } from './constants';
+import {
+  COMMANDS,
+  VIEWS,
+  CONFIG,
+  DEVICE_PRESETS,
+  DISPLAY_RULES,
+  BOOT_WATCH,
+  CUTOUT_MODES,
+  NAVBAR_MODES,
+  OVERLAY_MIN_API,
+  getDefaultAbi,
+} from './constants';
 import { SdkManager } from './sdk/SdkManager';
 import { AdbClient, assertSafeShellToken } from './adb/AdbClient';
 import { DeviceTracker } from './adb/DeviceTracker';
 import { AvdManager } from './avd/AvdManager';
-import { analyzeDisplay, formatDisplayReport, RuntimeDisplay } from './avd/DisplayCheck';
+import {
+  analyzeDisplay,
+  formatDisplayReport,
+  guestRamFloorMb,
+  heapForRamMb,
+  RuntimeDisplay,
+} from './avd/DisplayCheck';
 import { runLaunchPreflight } from './avd/LaunchPreflight';
+import { MemoryWatcher } from './avd/MemoryWatcher';
+import { BootPhase, classifyBoot, describeBootPhase, probeBootState } from './avd/BootState';
 import { checkAcceleration, clearAccelerationCache } from './utils/HostResources';
 import { DemoModeController } from './capture/DemoMode';
+import { SystemUiOverlayController, OverlayCategory } from './capture/SystemUiOverlay';
 import { DeviceStateManager, DeviceStateSnapshot } from './capture/DeviceState';
 import { CaptureService, RunManifest, writeRunReport } from './capture/CaptureService';
 import { CaptureCancelledError, Orientation } from './capture/Orientation';
@@ -41,8 +61,17 @@ let deviceTreeProvider: DeviceTreeProvider;
 let fileExplorerProvider: FileExplorerProvider;
 let statusBarItem: vscode.StatusBarItem;
 let demoStatusBarItem: vscode.StatusBarItem | undefined;
+let memoryWatcher: MemoryWatcher | undefined;
 /** Serials with a capture run in progress, so two runs cannot fight. */
 const captureInFlight = new Set<string>();
+/** Serials already offered a leftover-override cleanup this session. */
+const leftoverPrompted = new Set<string>();
+/**
+ * AVDs whose saved snapshot is known bad — a force-kill never let qemu flush.
+ * The next launch of these must be a cold boot or it will restore a corrupt
+ * state and appear to hang.
+ */
+const snapshotSuspect = new Set<string>();
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   // Initialize output channel
@@ -113,6 +142,21 @@ async function initializeWithSdk(context: vscode.ExtensionContext, sdk: SdkInfo)
   avdManager = new AvdManager(sdk);
   deviceTracker = new DeviceTracker(sdk, adbClient);
 
+  // AvdManager has no vscode import, so the guest-RAM toggle is pushed in.
+  const syncGuestRamSetting = () => avdManager.setCheckGuestRam(
+    vscode.workspace.getConfiguration(CONFIG.SECTION).get<boolean>(CONFIG.CHECK_GUEST_RAM, true),
+  );
+  syncGuestRamSetting();
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
+    if (e.affectsConfiguration(`${CONFIG.SECTION}.${CONFIG.CHECK_GUEST_RAM}`)) {
+      syncGuestRamSetting();
+      avdTreeProvider?.refresh();
+    }
+  }));
+
+  memoryWatcher = new MemoryWatcher();
+  context.subscriptions.push(memoryWatcher);
+
   // Tree views
   avdTreeProvider = new AvdTreeProvider(avdManager);
   deviceTreeProvider = new DeviceTreeProvider(deviceTracker);
@@ -150,6 +194,8 @@ async function initializeWithSdk(context: vscode.ExtensionContext, sdk: SdkInfo)
     }
     if (device.state === 'device') {
       checkPendingRestores(context).catch(err => Logger.warn(`Pending-restore check failed: ${err}`));
+      checkLeftoverOverrides(context, device.serial)
+        .catch(err => Logger.warn(`Leftover-override check failed: ${err}`));
     }
   });
 
@@ -331,6 +377,7 @@ function registerCommands(context: vscode.ExtensionContext): void {
           label: `API ${img.apiLevel} - ${img.tag}/${img.abi}`,
           description: img.installed ? 'Installed' : 'Not installed',
           detail: img.path,
+          image: img,
         })),
         { placeHolder: 'Select a system image' }
       );
@@ -362,11 +409,29 @@ function registerCommands(context: vscode.ExtensionContext): void {
         { location: vscode.ProgressLocation.Notification, title: `Creating AVD "${name}"...` },
         async () => { await avdManager.createAvd(name, picked.detail, device); }
       );
+      // The device profile supplies the display, but nothing supplies RAM: the
+      // custom path wrote no hw.ramSize at all, leaving the emulator's 1536 MB
+      // default, which a modern Google APIs image thrashes on. Only ever raise.
+      const floor = guestRamFloorMb(picked.image.apiLevel, picked.image.tag);
+      const created = avdManager.readAvdConfig(name);
+      const currentRam = parseInt(created['hw.ramSize'] || '0', 10) || 0;
+      if (floor && currentRam < floor) {
+        try {
+          avdManager.updateAvdConfig(name, {
+            'hw.ramSize': String(floor),
+            'vm.heapSize': String(heapForRamMb(floor)),
+          });
+          Logger.info(`Set hw.ramSize=${floor} MB on "${name}" (API ${picked.image.apiLevel} ${picked.image.tag}).`);
+        } catch (err) {
+          Logger.warn(`Could not set RAM on "${name}": ${err}`);
+        }
+      }
+
       avdTreeProvider.refresh();
 
       // No preset to draw hardware from here, so check the result rather than
       // silently shipping a 320×640 AVD.
-      const report = analyzeDisplay(avdManager.readAvdConfig(name), name);
+      const report = analyzeDisplay(avdManager.readAvdConfig(name), name, undefined, { checkGuestRam: true });
       if (!report.healthy) {
         vscode.window.showWarningMessage(
           `AVD "${name}" was created without a usable display configuration (${report.summary}).`,
@@ -393,12 +458,44 @@ function registerCommands(context: vscode.ExtensionContext): void {
   });
 
   reg(COMMANDS.STOP_AVD, async (item?: AvdTreeItem) => {
-    if (!item?.avd.serial) {
-      vscode.window.showWarningMessage('Cannot determine emulator serial. Try stopping from the device list.');
+    const avdName = item?.avd.name || await pickAvd('Select an emulator to stop');
+    if (!avdName) { return; }
+
+    // Fall back to asking adb: an emulator started before this window opened
+    // has no tracked serial, and refusing to stop it was the old behaviour.
+    const serial = item?.avd.serial || await resolveAvdSerial(avdName);
+    if (!serial) {
+      vscode.window.showWarningMessage(`"${avdName}" does not appear to be running.`);
+      avdTreeProvider.refresh();
       return;
     }
-    await avdManager.stopEmulator(item.avd.serial);
+
+    const stopped = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `Stopping ${avdName}...`, cancellable: false },
+      () => avdManager.stopEmulator(serial),
+    );
     avdTreeProvider.refresh();
+
+    if (!stopped) {
+      vscode.window.showWarningMessage(
+        `"${avdName}" did not shut down. It may be wedged.`,
+        'Repair...',
+      ).then(choice => {
+        if (choice === 'Repair...') {
+          vscode.commands.executeCommand(COMMANDS.REPAIR_AVD, { avd: { name: avdName } });
+        }
+      });
+    }
+  });
+
+  reg(COMMANDS.REPAIR_AVD, async (item?: AvdTreeItem) => {
+    const avdName = item?.avd.name || await pickAvd('Select an emulator to repair');
+    if (!avdName) { return; }
+    try {
+      await repairAvd(avdName);
+    } catch (err) {
+      vscode.window.showErrorMessage(`Repair failed: ${err instanceof Error ? err.message : err}`);
+    }
   });
 
   reg(COMMANDS.DELETE_AVD, async (item?: AvdTreeItem) => {
@@ -972,7 +1069,7 @@ function registerCommands(context: vscode.ExtensionContext): void {
     const serial = item?.device.serial || await pickDevice();
     if (!serial) { return; }
     try {
-      await captureStoreScreenshots(serial);
+      await captureStoreScreenshots(context, serial);
     } catch (err) {
       if (!(err instanceof CaptureCancelledError)) {
         vscode.window.showErrorMessage(`Capture failed: ${err instanceof Error ? err.message : err}`);
@@ -990,6 +1087,18 @@ function registerCommands(context: vscode.ExtensionContext): void {
         vscode.window.showErrorMessage(`Matrix run failed: ${err instanceof Error ? err.message : err}`);
       }
     }
+  });
+
+  reg(COMMANDS.SET_DISPLAY_CUTOUT, async (item?: DeviceTreeItem) => {
+    const serial = item?.device.serial || await pickDevice();
+    if (!serial) { return; }
+    await applyOverlayMode(serial, 'cutout');
+  });
+
+  reg(COMMANDS.SET_NAVIGATION_MODE, async (item?: DeviceTreeItem) => {
+    const serial = item?.device.serial || await pickDevice();
+    if (!serial) { return; }
+    await applyOverlayMode(serial, 'navbar');
   });
 
   reg(COMMANDS.OPEN_CAPTURE_FOLDER, async () => {
@@ -1016,8 +1125,9 @@ function registerCommands(context: vscode.ExtensionContext): void {
       {
         modal: true,
         detail: 'Clears the display size and density overrides, font scale, forced RTL, '
-          + 'rotation lock, and demo mode. Per-app languages set by a matrix run are not '
-          + 'touched here — use "Restore Now" on the pending-restore prompt for those.',
+          + 'rotation lock, demo mode, and any cutout or navigation-bar emulation. '
+          + 'Per-app languages set by a matrix run are not touched here — use '
+          + '"Restore Now" on the pending-restore prompt for those.',
       },
       'Reset'
     );
@@ -1111,7 +1221,114 @@ async function syncRunningAvds(devices: DeviceInfo[]): Promise<void> {
       }
     }
   }
+
+  // Drop AVDs that are no longer running, so the tracked serial (and therefore
+  // the Stop command) never points at a dead emulator.
+  avdManager.reconcileRunning(runningNames);
+
+  // Only watch host memory while there is something to protect.
+  if (runningNames.size > 0) { memoryWatcher?.start(); } else { memoryWatcher?.stop(); }
+
   avdTreeProvider.updateRunningStatus(runningNames);
+}
+
+/** Pick and apply a cutout or navigation-bar emulation mode. */
+async function applyOverlayMode(serial: string, category: OverlayCategory): Promise<void> {
+  const isCutout = category === 'cutout';
+  const modes = isCutout ? CUTOUT_MODES : NAVBAR_MODES;
+  const minApi = isCutout ? OVERLAY_MIN_API.CUTOUT : OVERLAY_MIN_API.NAVBAR;
+  const what = isCutout ? 'Display cutout' : 'Navigation mode';
+
+  try {
+    const api = await adbClient.getApiLevel(serial);
+    if (api && api < minApi) {
+      vscode.window.showWarningMessage(
+        `${what} emulation needs Android ${minApi === 28 ? '9' : '10'} (API ${minApi}) or newer; this device is API ${api}.`,
+      );
+      return;
+    }
+
+    const overlays = new SystemUiOverlayController(adbClient);
+    const available = await overlays.available(serial, category);
+    const active = await overlays.current(serial, category);
+
+    const items = modes
+      .filter(m => !m.pkg || available.has(m.pkg))
+      .map(m => ({
+        label: `${m.id === active ? '$(check) ' : ''}${m.label}`,
+        description: m.id === active ? 'current' : undefined,
+        detail: m.description,
+        id: m.id,
+        pkg: m.pkg,
+      }));
+
+    if (items.length <= 1) {
+      vscode.window.showWarningMessage(
+        `This system image does not ship the ${isCutout ? 'cutout' : 'navigation bar'} emulation overlays.`,
+      );
+      return;
+    }
+
+    const pick = await vscode.window.showQuickPick(items, {
+      placeHolder: `${what} for ${serial}`,
+      ignoreFocusOut: true,
+    });
+    if (!pick) { return; }
+
+    const applied = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `Applying ${pick.detail}...`, cancellable: false },
+      () => overlays.apply(serial, category, pick.pkg),
+    );
+
+    // Read back rather than trust the command: `cmd overlay` reports success
+    // even when the overlay is not actually installed or was rejected.
+    if (applied === pick.id) {
+      vscode.window.showInformationMessage(`${what}: ${pick.detail}.`);
+    } else {
+      vscode.window.showWarningMessage(
+        `${what} did not change — the device still reports "${applied}". `
+        + 'Some images ignore these overlays.',
+      );
+    }
+  } catch (err) {
+    vscode.window.showErrorMessage(`Could not set the ${isCutout ? 'cutout' : 'navigation mode'}: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+/**
+ * Offer to clean up overrides left on a device by a run this session never saw
+ * — a crash that lost globalState, another machine, or an older build.
+ *
+ * Deliberately separate from checkPendingRestores, which can only act on
+ * records this extension wrote.
+ */
+async function checkLeftoverOverrides(context: vscode.ExtensionContext, serial: string): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration(CONFIG.SECTION);
+  if (!cfg.get<boolean>(CONFIG.CAPTURE_DETECT_LEFTOVERS, true)) { return; }
+  if (leftoverPrompted.has(serial)) { return; }
+  if (captureInFlight.has(serial)) { return; }
+
+  const manager = new DeviceStateManager(adbClient, context);
+  // A pending record means checkPendingRestores owns this device; a second
+  // prompt for the same thing would be noise.
+  if (manager.getPending(serial)) { return; }
+
+  const found = await manager.detectLeftoverOverrides(serial);
+  if (found.length === 0) { return; }
+
+  leftoverPrompted.add(serial);
+  Logger.info(`Leftover overrides on ${serial}: ${found.join('; ')}`);
+
+  const choice = await vscode.window.showWarningMessage(
+    `${serial} still has ${found.join(', ')} from an earlier capture run.`,
+    'Reset Overrides',
+    "Don't Check Again",
+  );
+  if (choice === 'Reset Overrides') {
+    vscode.commands.executeCommand(COMMANDS.RESET_DEVICE_OVERRIDES, { device: { serial } });
+  } else if (choice === "Don't Check Again") {
+    await cfg.update(CONFIG.CAPTURE_DETECT_LEFTOVERS, false, vscode.ConfigurationTarget.Global);
+  }
 }
 
 function autoSelectFileExplorerDevice(devices: DeviceInfo[]): void {
@@ -1158,65 +1375,261 @@ function updateStatusBar(devices: DeviceInfo[]): void {
 /**
  * Shared launch path for LAUNCH_AVD and COLD_BOOT_AVD, so the two cannot drift.
  */
-async function launchAvdWithPreflight(avdName: string, opts: { coldBoot: boolean }): Promise<void> {
+async function launchAvdWithPreflight(
+  avdName: string,
+  opts: { coldBoot: boolean; wipeData?: boolean },
+): Promise<void> {
   const cfg = vscode.workspace.getConfiguration(CONFIG.SECTION);
   // Spread: getConfiguration().get() returns shared (frozen) config state, and
   // the previous code pushed straight into it.
   const extraArgs = [...cfg.get<string[]>(CONFIG.EMULATOR_ARGS, [])];
 
-  const coldBoot = opts.coldBoot || cfg.get<boolean>(CONFIG.COLD_BOOT, false);
+  // A force-killed emulator left an unflushed snapshot behind; loading it is
+  // exactly the hang we are trying to avoid, so escalate to a cold boot.
+  const coldBoot = opts.coldBoot || opts.wipeData
+    || cfg.get<boolean>(CONFIG.COLD_BOOT, false)
+    || snapshotSuspect.has(avdName);
   if (coldBoot && !extraArgs.includes('-no-snapshot-load')) {
     extraArgs.push('-no-snapshot-load');
+  }
+  if (opts.wipeData && !extraArgs.includes('-wipe-data')) {
+    extraArgs.push('-wipe-data');
   }
 
   if (!(await runLaunchPreflight(avdManager, avdName))) { return; }
 
   const captureLog = cfg.get<boolean>(CONFIG.CAPTURE_LOG, true);
   const proc = avdManager.launchEmulator(avdName, extraArgs, captureLog);
+  snapshotSuspect.delete(avdName);
+
+  const timeoutSec = cfg.get<number>(CONFIG.BOOT_TIMEOUT_SEC, BOOT_WATCH.DEFAULT_TIMEOUT_SEC);
 
   vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: `Booting emulator: ${avdName}...`, cancellable: false },
-    async () => {
-      // Wait until the emulator appears in the device list (up to 60s), but
-      // bail out early when the log shows the launch has already died.
-      for (let i = 0; i < 30; i++) {
-        await new Promise(r => setTimeout(r, 2000));
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: `Starting ${avdName}`,
+      // Cancelling stops the watch, not the emulator — the message says so.
+      cancellable: true,
+    },
+    async (progress, token) => {
+      const started = Date.now();
+      const deadline = started + timeoutSec * 1000;
+      let serial: string | undefined;
+      let phase: BootPhase = 'offline';
+      let wedgedStreak = 0;
+
+      progress.report({ message: describeBootPhase('offline') });
+
+      while (Date.now() < deadline) {
+        if (token.isCancellationRequested) {
+          Logger.info(`Stopped watching the boot of ${avdName}; the emulator is still starting.`);
+          avdTreeProvider.refresh();
+          return;
+        }
+        await new Promise(r => setTimeout(r, BOOT_WATCH.POLL_MS));
 
         const failure = captureLog ? avdManager.readLaunchFailure(avdName) : undefined;
         if (failure) {
           avdTreeProvider.refresh();
-          vscode.window.showErrorMessage(`Emulator failed to start: ${failure}`, 'Show Log').then(c => {
-            if (c === 'Show Log') { vscode.commands.executeCommand(COMMANDS.SHOW_EMULATOR_LOG, { avd: { name: avdName } }); }
-          });
+          reportLaunchProblem(avdName, `Emulator failed to start: ${failure}`);
           return;
         }
         if (proc.process && proc.process.exitCode !== null && proc.process.exitCode !== 0) {
           avdTreeProvider.refresh();
-          vscode.window.showErrorMessage(
-            `Emulator exited immediately (code ${proc.process.exitCode}).`,
-            'Show Log'
-          ).then(c => {
-            if (c === 'Show Log') { vscode.commands.executeCommand(COMMANDS.SHOW_EMULATOR_LOG, { avd: { name: avdName } }); }
-          });
+          reportLaunchProblem(avdName, `Emulator exited immediately (code ${proc.process.exitCode}).`);
           return;
         }
 
-        const devices = await adbClient.getDevices();
-        for (const d of devices) {
-          if (d.type === 'emulator' && d.state === 'device') {
-            try {
-              const name = await adbClient.getEmulatorAvdName(d.serial);
-              if (name === avdName) {
-                avdTreeProvider.refresh();
-                return;
+        // Resolve the serial once, then probe the guest itself. `adb devices`
+        // reporting state=device is a console-port signal, not a boot signal.
+        if (!serial) {
+          try {
+            for (const d of await adbClient.getDevices()) {
+              if (d.type === 'emulator' && d.state === 'device') {
+                if (await adbClient.getEmulatorAvdName(d.serial) === avdName) { serial = d.serial; break; }
               }
-            } catch { /* retry */ }
-          }
+            }
+          } catch { /* adb not ready yet */ }
+          if (!serial) { continue; }
+          avdManager.markRunning(avdName, serial);
+          avdTreeProvider.refresh();
+        }
+
+        const signals = await probeBootState(adbClient, serial);
+        const next = classifyBoot(signals, Date.now() - started);
+        if (next !== phase) {
+          phase = next;
+          progress.report({ message: describeBootPhase(phase) });
+        }
+
+        if (phase === 'ready') {
+          Logger.info(`${avdName} finished booting in ${Math.round((Date.now() - started) / 1000)}s.`);
+          avdTreeProvider.refresh();
+          return;
+        }
+
+        // Require the verdict twice running before giving up on a boot: a
+        // single unlucky probe against a busy guest is not evidence of a hang.
+        wedgedStreak = next === 'wedged' ? wedgedStreak + 1 : 0;
+        if (wedgedStreak >= 2) {
+          avdTreeProvider.refresh();
+          reportLaunchProblem(
+            avdName,
+            `${avdName} started but Android never finished booting`
+            + `${signals.pmError ? ` — the package manager reports "${signals.pmError.split('\n')[0].trim()}"` : ''}. `
+            + 'This is usually too little guest RAM or a corrupt snapshot.',
+          );
+          return;
         }
       }
+
       avdTreeProvider.refresh();
+      // Previously this fell through silently, making a slow boot and a hang
+      // look identical. Say which one it was.
+      reportLaunchProblem(
+        avdName,
+        `${avdName} has not finished booting after ${timeoutSec}s (${describeBootPhase(phase).toLowerCase()}).`,
+      );
     }
   );
+}
+
+/**
+ * Report a failed or stalled launch, opening the captured log automatically.
+ *
+ * The log is the thing that actually explains a PANIC or an OOM, and asking the
+ * user to go find "Show Emulator Launch Log" after the fact is why these
+ * failures read as unexplained hangs.
+ */
+function reportLaunchProblem(avdName: string, message: string): void {
+  const captureLog = vscode.workspace.getConfiguration(CONFIG.SECTION).get<boolean>(CONFIG.CAPTURE_LOG, true);
+  if (captureLog && fs.existsSync(avdManager.getLaunchLogPath(avdName))) {
+    vscode.commands.executeCommand(COMMANDS.SHOW_EMULATOR_LOG, { avd: { name: avdName } });
+  }
+  vscode.window.showErrorMessage(message, 'Repair...', 'Show Log').then(choice => {
+    if (choice === 'Repair...') {
+      vscode.commands.executeCommand(COMMANDS.REPAIR_AVD, { avd: { name: avdName } });
+    } else if (choice === 'Show Log') {
+      vscode.commands.executeCommand(COMMANDS.SHOW_EMULATOR_LOG, { avd: { name: avdName } });
+    }
+  });
+}
+
+/**
+ * Escalating repair for an emulator that will not start or will not stop.
+ *
+ * Ordered cheapest-first, and each rung states what it costs — the wipe in
+ * particular destroys app data and any placed home-screen widgets, which is not
+ * recoverable and not obvious from the word "wipe".
+ */
+async function repairAvd(avdName: string): Promise<void> {
+  const serial = await resolveAvdSerial(avdName);
+
+  interface RepairAction extends vscode.QuickPickItem { id: string }
+  const actions: RepairAction[] = [];
+
+  if (serial) {
+    actions.push({
+      id: 'stop',
+      label: '$(debug-stop) Stop the emulator cleanly',
+      description: 'adb emu kill',
+      detail: 'Asks the emulator to shut down and save its snapshot. Always try this first.',
+    });
+  }
+  actions.push({
+    id: 'cold',
+    label: '$(debug-restart) Cold boot — discard the saved snapshot',
+    description: '-no-snapshot-load',
+    detail: 'Boots from scratch. Slower, but fixes a snapshot that was saved in a bad state. App data is kept.',
+  });
+  actions.push({
+    id: 'wipe',
+    label: '$(trash) Wipe data — factory reset the virtual device',
+    description: '-wipe-data',
+    detail: 'Destroys all app data, accounts, and home-screen widgets on this AVD. The first boot afterwards is slow.',
+  });
+
+  const pick = await vscode.window.showQuickPick(actions, {
+    placeHolder: `Repair "${avdName}" — start with the least destructive option`,
+    ignoreFocusOut: true,
+  });
+  if (!pick) { return; }
+
+  if (pick.id === 'stop' && serial) {
+    const stopped = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `Stopping ${avdName}...`, cancellable: false },
+      () => avdManager.stopEmulator(serial),
+    );
+    avdTreeProvider.refresh();
+    if (stopped) {
+      vscode.window.showInformationMessage(`"${avdName}" stopped.`);
+      return;
+    }
+
+    const force = await vscode.window.showWarningMessage(
+      `"${avdName}" ignored the shutdown request.`,
+      {
+        modal: true,
+        detail: 'Force-killing the emulator process stops it immediately, but qemu never gets to flush its '
+          + 'state, so the saved snapshot is left corrupt. Caspian will cold boot this AVD next time to avoid '
+          + 'loading it. App data is not affected.',
+      },
+      'Force Kill',
+    );
+    if (force !== 'Force Kill') { return; }
+
+    const killed = await avdManager.forceKillEmulator(avdName);
+    snapshotSuspect.add(avdName);
+    avdTreeProvider.refresh();
+    vscode.window.showWarningMessage(
+      killed
+        ? `"${avdName}" was force-killed. Its next start will be a cold boot.`
+        : `Caspian has no handle on the "${avdName}" process — it was started outside this window. `
+          + 'Close the emulator window directly, then cold boot it.',
+    );
+    return;
+  }
+
+  if (pick.id === 'wipe') {
+    const confirm = await vscode.window.showWarningMessage(
+      `Wipe all data on "${avdName}"?`,
+      {
+        modal: true,
+        detail: 'This factory-resets the virtual device. Every installed app, signed-in account, and '
+          + 'home-screen widget on it is destroyed and cannot be recovered. The next boot takes several minutes.',
+      },
+      'Wipe Data',
+    );
+    if (confirm !== 'Wipe Data') { return; }
+  }
+
+  if (serial) {
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `Stopping ${avdName}...`, cancellable: false },
+      () => avdManager.stopEmulator(serial),
+    );
+  }
+  await launchAvdWithPreflight(avdName, { coldBoot: true, wipeData: pick.id === 'wipe' });
+}
+
+/**
+ * Find the serial of a running AVD.
+ *
+ * Prefers the tracked value, then falls back to asking every emulator its AVD
+ * name — the tracked map is empty for emulators started before this window.
+ */
+async function resolveAvdSerial(avdName: string): Promise<string | undefined> {
+  try {
+    for (const d of await adbClient.getDevices()) {
+      if (d.type !== 'emulator' || d.state !== 'device') { continue; }
+      try {
+        if (await adbClient.getEmulatorAvdName(d.serial) === avdName) { return d.serial; }
+      } catch { /* device busy — try the next one */ }
+    }
+  } catch (err) {
+    Logger.warn(`Could not resolve a serial for ${avdName}: ${err}`);
+  }
+  return undefined;
 }
 
 // ── AVD display check ──
@@ -1268,19 +1681,29 @@ async function checkAvdDisplay(avdName: string): Promise<void> {
   const report = analyzeDisplay(config, avdName, runtime, {
     strictPlayAspect: strict,
     skinPathExists: (p) => fs.existsSync(p),
+    checkGuestRam: vscode.workspace.getConfiguration(CONFIG.SECTION).get<boolean>(CONFIG.CHECK_GUEST_RAM, true),
   });
 
   Logger.info(formatDisplayReport(report));
 
   if (report.issues.length === 0) {
     vscode.window.showInformationMessage(
-      `"${avdName}" display looks correct: ${report.summary}. Play screenshot ratio ${report.play.ratio.toFixed(2)}:1.`
+      `"${avdName}" looks correct: ${report.summary}, ${report.ramMb || 'default'} MB RAM. `
+      + `Play screenshot ratio ${report.play.ratio.toFixed(2)}:1.`
     );
     return;
   }
 
   interface Action { label: string; description?: string; detail?: string; id: string }
   const actions: Action[] = [];
+  if (report.issues.some(i => i.kind === 'ram-below-floor' || i.kind === 'ram-implausible') && report.ramFloorMb) {
+    actions.push({
+      label: `$(check) Raise RAM to ${report.ramFloorMb} MB`,
+      description: 'Recommended — writes hw.ramSize, survives wipe',
+      detail: `Currently ${report.ramMb || 'unset'} MB. Below ${report.ramFloorMb} MB this image swaps and stops responding.`,
+      id: 'fix-ram',
+    });
+  }
   if (report.suggestion) {
     actions.push({
       label: `$(check) Fix config.ini → ${report.suggestion.width}×${report.suggestion.height} @ ${report.suggestion.density} dpi`,
@@ -1332,7 +1755,12 @@ async function checkAvdDisplay(avdName: string): Promise<void> {
 
   let props: Record<string, string> | undefined;
 
-  if (pick.id === 'fix-skin') {
+  if (pick.id === 'fix-ram') {
+    props = {
+      'hw.ramSize': String(report.ramFloorMb),
+      'vm.heapSize': String(heapForRamMb(report.ramFloorMb)),
+    };
+  } else if (pick.id === 'fix-skin') {
     props = { 'skin.path': '_no_skin' };
     if (report.config) { props['skin.name'] = `${report.config.width}x${report.config.height}`; }
   } else if (pick.id === 'fix-preset' && report.suggestion) {
@@ -1435,7 +1863,7 @@ async function reportCaptureRun(
   });
 }
 
-async function captureStoreScreenshots(serial: string): Promise<void> {
+async function captureStoreScreenshots(context: vscode.ExtensionContext, serial: string): Promise<void> {
   if (captureInFlight.has(serial)) {
     vscode.window.showWarningMessage('A capture run is already in progress on that device.');
     return;
@@ -1446,6 +1874,19 @@ async function captureStoreScreenshots(serial: string): Promise<void> {
   const useDemoMode = vscode.workspace.getConfiguration(CONFIG.SECTION)
     .get<boolean>(CONFIG.CAPTURE_USE_DEMO_MODE, true);
   const deviceLabel = deviceLabelFor(serial);
+
+  // Persist a restore record before touching anything. captureOrientations
+  // restores in a finally, but that never runs if VS Code dies mid-run — which
+  // used to leave rotation pinned and demo mode on with nothing to recover from.
+  const stateManager = new DeviceStateManager(adbClient, context);
+  const snapshot = await stateManager.capture(serial, deviceLabel, {
+    rotation: true,
+    demo: useDemoMode,
+    // The tablet trick moves wm density, which survives a reboot.
+    density: vscode.workspace.getConfiguration(CONFIG.SECTION).get<boolean>(CONFIG.CAPTURE_TABLET_TRICK, false),
+  });
+  snapshot.demoModeEntered = useDemoMode;
+  await stateManager.persist(snapshot);
 
   captureInFlight.add(serial);
   EmulatorScreenPanel.setPaused(serial, true);
@@ -1472,6 +1913,9 @@ async function captureStoreScreenshots(serial: string): Promise<void> {
   } finally {
     EmulatorScreenPanel.setPaused(serial, false);
     captureInFlight.delete(serial);
+    // captureOrientations already restored rotation and demo mode in its own
+    // finally, so the record has served its purpose either way.
+    await stateManager.clearPending(serial).catch(() => { /* best effort */ });
     updateDemoStatusBar();
   }
 }
@@ -1634,7 +2078,13 @@ async function runCaptureMatrix(context: vscode.ExtensionContext, serial: string
       }
     }
 
-    const runner = new MatrixRunner(adbClient, new CaptureService(adbClient));
+    // Hand the runner the demo controller so it can re-apply screenshot mode
+    // after a density change restarts SystemUI.
+    const runner = new MatrixRunner(
+      adbClient,
+      new CaptureService(adbClient),
+      DemoModeController.isActive(serial) ? demo : undefined,
+    );
     const outcome = await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: `Capture matrix on ${deviceLabel}`, cancellable: true },
       (progress, token) => runner.run(

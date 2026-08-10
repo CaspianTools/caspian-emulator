@@ -464,6 +464,39 @@ export class AdbClient {
     await this.putSetting(serial, 'system', 'user_rotation', rotation);
   }
 
+  /**
+   * List runtime resource overlays as `{ pkg, enabled }`.
+   *
+   * `cmd overlay list` groups by target package and marks state in the first
+   * column: `[x]` enabled, `[ ]` disabled, `---` not installed on this image.
+   */
+  async listOverlays(serial: string): Promise<Array<{ pkg: string; enabled: boolean }>> {
+    const out = await this.shell(serial, ['cmd', 'overlay', 'list']);
+    const overlays: Array<{ pkg: string; enabled: boolean }> = [];
+    for (const line of out.split('\n')) {
+      const m = line.match(/^\s*\[([x\s])\]\s+(\S+)/);
+      if (m) { overlays.push({ pkg: m[2], enabled: m[1] === 'x' }); }
+    }
+    return overlays;
+  }
+
+  /**
+   * Enable one overlay and disable every sibling in its category, which is how
+   * the cutout and navbar sets are meant to be driven — they are mutually
+   * exclusive and enabling two at once produces undefined layout.
+   */
+  async enableOverlayExclusive(serial: string, pkg: string): Promise<void> {
+    assertSafeShellToken(pkg, 'overlay package');
+    await this.shell(serial, ['cmd', 'overlay', 'enable-exclusive', '--category', pkg]);
+    Logger.info(`Enabled overlay ${pkg} (exclusive in category) on ${serial}`);
+  }
+
+  async disableOverlay(serial: string, pkg: string): Promise<void> {
+    assertSafeShellToken(pkg, 'overlay package');
+    await this.shell(serial, ['cmd', 'overlay', 'disable', pkg]);
+    Logger.info(`Disabled overlay ${pkg} on ${serial}`);
+  }
+
   /** Per-app locales (API 33+). Returns [] when the app follows the system default. */
   async getAppLocales(serial: string, packageName: string): Promise<string[]> {
     const out = await this.shell(serial, ['cmd', 'locale', 'get-app-locales', packageName]);

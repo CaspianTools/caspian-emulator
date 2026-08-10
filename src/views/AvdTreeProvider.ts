@@ -21,21 +21,28 @@ export class AvdTreeItem extends vscode.TreeItem {
       `Display: ${avd.lcdWidth && avd.lcdHeight
         ? `${avd.lcdWidth}×${avd.lcdHeight}${avd.lcdDensity ? ` @ ${avd.lcdDensity} dpi` : ''}`
         : 'not configured — the emulator will fall back to 320×640'}`,
-      `RAM: ${avd.ramMb ? `${avd.ramMb} MB` : 'default'}`,
+      `RAM: ${avd.ramMb ? `${avd.ramMb} MB` : 'default'}`
+        + (!avd.ramHealthy && avd.ramFloorMb ? ` — below the ${avd.ramFloorMb} MB this image needs` : ''),
       `Status: ${avd.running ? 'Running' : 'Stopped'}`,
       ...(avd.displayProblem
-        ? ['', `⚠ ${avd.displayProblem}`, 'Run "Caspian: Check Display Configuration" to fix.']
+        ? ['', `⚠ ${avd.displayProblem}`, 'Run "Caspian: Check Device Configuration" to fix.']
         : []),
     ].join('\n');
 
     // NOTE: package.json matches these with regex (viewItem =~ /^avd\.stopped/),
-    // not equality — a suffix here must not hide Launch/Stop/Delete.
+    // not equality — a suffix here must not hide Launch/Stop/Delete. Suffixes
+    // compose, so a low-RAM AVD with a broken display carries both.
     const state = avd.running ? 'avd.running' : 'avd.stopped';
-    this.contextValue = avd.displayHealthy ? state : `${state}.brokenDisplay`;
+    const suffixes = [
+      ...(avd.displayHealthy ? [] : ['brokenDisplay']),
+      ...(avd.ramHealthy ? [] : ['lowRam']),
+    ];
+    this.contextValue = [state, ...suffixes].join('.');
 
+    const needsAttention = !avd.displayHealthy || !avd.ramHealthy;
     this.iconPath = new vscode.ThemeIcon(
       avd.running ? 'vm-running' : 'vm',
-      !avd.displayHealthy
+      needsAttention
         ? new vscode.ThemeColor('problemsWarningIcon.foreground')
         : avd.running ? new vscode.ThemeColor('testing.iconPassed') : undefined
     );

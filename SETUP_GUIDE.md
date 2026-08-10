@@ -95,13 +95,17 @@ sdkmanager "platform-tools" "emulator" "cmdline-tools;latest"
 | `caspian.emulator.memoryHeadroomMb` | number | `1024` | Memory to leave for the host beyond the requirement |
 | `caspian.emulator.checkAcceleration` | boolean | `true` | Check WHPX/HAXM/KVM before the first launch of a session |
 | `caspian.emulator.captureLog` | boolean | `true` | Capture emulator output so launch failures can be reported |
+| `caspian.emulator.bootTimeoutSec` | number | `180` | How long to wait for Android to finish booting before reporting a stall |
+| `caspian.emulator.watchHostMemory` | boolean | `true` | Warn when host memory runs low while an emulator is running |
+| `caspian.emulator.lowMemoryFloorMb` | number | `512` | Free memory below which that warning fires (`0` disables it) |
+| `caspian.avd.checkGuestRam` | boolean | `true` | Flag AVDs with less RAM than their system image needs |
 | `caspian.avd.playStoreStrictAspect` | boolean | `false` | Enforce Play's documented 16:9 rule |
 | `caspian.captureDirectory` | string | `"${workspaceFolder}/.caspian/captures"` | Where capture runs are written |
 | `caspian.capture.useDemoMode` | boolean | `true` | Use screenshot mode during capture runs |
 | `caspian.capture.maxAspectRatio` | number | `2` | Max long/short ratio accepted when validating captures |
 | `caspian.demoMode.clock` | string | `"1000"` | Clock shown in screenshot mode (24-hour HHMM) |
 
-See the [readme](readme.md#settings) for the full list of 28 settings.
+See the [readme](readme.md#settings) for the full list of 34 settings.
 
 ### Emulator Launch Arguments
 
@@ -181,19 +185,38 @@ The extension falls back to `adb shell screencap` which captures screenshots at 
 - Click the **refresh** button in the Virtual Devices panel
 
 **Emulator won't start, or hangs partway through boot**
+- Caspian now waits for Android itself rather than for the device to appear in `adb devices`, and reports a stalled boot instead of giving up silently. The launch log opens automatically when that happens
+- Run **Caspian: Repair Virtual Device** — it walks the ladder from least to most destructive: stop cleanly, cold boot (discards the snapshot, keeps app data), then wipe data (destroys app data and any placed home-screen widgets)
 - Run **Caspian: Show Emulator Launch Log** — the emulator's own output is captured on every launch and usually names the cause
 - Run **Caspian: Check Emulator Acceleration** to confirm WHPX, HAXM, or KVM is available. Without it the emulator runs in software mode and can take minutes or fail outright. On Windows 11, enable **Windows Hypervisor Platform** and **Virtual Machine Platform** in Windows Features, then reboot
-- If the emulator hangs with no error, run **Caspian: Check Display Configuration**. A virtual device created before v1.1.0 may have only 96 MB of RAM, which is not enough for Android to finish booting — and no amount of wiping data will fix it, because the defect is in `config.ini`
-- Close memory-heavy processes. Caspian warns before launching when free RAM is short and can stop Gradle daemons for you
+- Run **Caspian: Check Device Configuration**. Two RAM faults show up here: a virtual device created before v1.1.0 may have only 96 MB, which cannot boot Android at all; and an API 33+ Google APIs image on the emulator's 1536 MB default will boot and then swap, ANR, and show "System UI isn't responding". Both are fixed in `config.ini`, so wiping data will not help
+- Close memory-heavy processes. Caspian warns before launching when free RAM is short, warns again if memory runs out *while* the emulator is running, and can stop Gradle daemons for you either way
 - Try adding `-gpu swiftshader_indirect` to `caspian.emulatorArgs`
 
+**The emulator won't stop**
+- **Caspian: Stop Emulator** now confirms the emulator actually went, rather than assuming `adb emu kill` worked
+- If it is ignored, **Caspian: Repair Virtual Device** offers a force kill. Take the warning seriously: killing the emulator process means qemu never flushes, so the saved snapshot is left corrupt. Caspian cold boots that AVD next time so the bad snapshot is never loaded
+- Never kill the emulator or `qemu-system-*` process yourself for this reason — it buys a wipe and a slow first boot
+
+**Testing notches, gesture navigation, and edge-to-edge layout**
+- **Caspian: Set Display Cutout (Notch)** switches a running device between corner, double, punch-hole, tall, and waterfall cutouts, or none. Use it to confirm your `displayCutout` insets are actually applied
+- **Caspian: Set Navigation Mode** switches between gesture, 2-button, and 3-button navigation
+- Both need Android 9 (cutouts) or Android 10 (navigation) and are verified by reading the overlay state back, because the underlying command reports success either way. Some system images do not ship the overlays at all, and Caspian says so rather than claiming a change it could not make
+- Both are undone by **Caspian: Reset Device Display & Language Overrides**
+
+**Landscape home-screen or widget screenshots**
+- The Pixel launcher refuses to rotate on a phone-sized display, and `wm set-ignore-orientation-request` is itself ignored below sw600dp, so a landscape home-screen shot is normally impossible
+- Set `caspian.capture.tabletTrickForLandscape` to `true`. Caspian then retries the shot at a lower density, which makes the same panel measure wide enough in dp for the launcher to allow landscape
+- Any shot taken this way is **marked in the capture report**, because the layout is real but the scale is not the device's own. Leave the setting off for store screenshots you intend to upload
+
 **Play Console rejects my screenshots**
-- Run **Caspian: Check Display Configuration** on the virtual device. If it reports 320x640, the AVD was created without a device profile and is not the device it claims to be — repair it from the same menu, then cold boot
+- Run **Caspian: Check Device Configuration** on the virtual device. If it reports 320x640, the AVD was created without a device profile and is not the device it claims to be — repair it from the same menu, then cold boot
 - Use **Caspian: Capture Store Screenshots**, which validates every shot against Play's size and aspect rules and tells you exactly what to change
 - A full-resolution modern phone screenshot (a Pixel 9 Pro is 2.23:1) exceeds Play's 2:1 limit and needs cropping or padding. The capture report gives you the target height
 
 **A device is stuck at the wrong size, font, or language**
 - Run **Caspian: Reset Device Display & Language Overrides**. `wm density` and `wm size` overrides survive a reboot, so an interrupted matrix run can leave a device mis-scaled
+- Caspian also checks a device for leftover overrides when it connects and offers to clear them, even when the run that caused them happened in another window or on another machine. Turn that off with `caspian.capture.detectLeftoverOverrides`
 
 **Device shows "unauthorized"**
 - Check the emulator/device screen for a USB debugging authorization prompt

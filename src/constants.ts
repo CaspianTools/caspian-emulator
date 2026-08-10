@@ -44,12 +44,15 @@ export const COMMANDS = {
   CHECK_AVD_DISPLAY: 'caspian.checkAvdDisplay',
   CHECK_ACCELERATION: 'caspian.checkAcceleration',
   SHOW_EMULATOR_LOG: 'caspian.showEmulatorLog',
+  REPAIR_AVD: 'caspian.repairAvd',
   // Screenshot & capture
   TOGGLE_DEMO_MODE: 'caspian.toggleDemoMode',
   CAPTURE_STORE_SCREENSHOTS: 'caspian.captureStoreScreenshots',
   RUN_CAPTURE_MATRIX: 'caspian.runCaptureMatrix',
   OPEN_CAPTURE_FOLDER: 'caspian.openCaptureFolder',
   RESET_DEVICE_OVERRIDES: 'caspian.resetDeviceOverrides',
+  SET_DISPLAY_CUTOUT: 'caspian.setDisplayCutout',
+  SET_NAVIGATION_MODE: 'caspian.setNavigationMode',
 } as const;
 
 export const VIEWS = {
@@ -77,6 +80,10 @@ export const CONFIG = {
   CHECK_ACCELERATION: 'emulator.checkAcceleration',
   CAPTURE_LOG: 'emulator.captureLog',
   PLAY_STRICT_ASPECT: 'avd.playStoreStrictAspect',
+  BOOT_TIMEOUT_SEC: 'emulator.bootTimeoutSec',
+  WATCH_HOST_MEMORY: 'emulator.watchHostMemory',
+  LOW_MEMORY_FLOOR_MB: 'emulator.lowMemoryFloorMb',
+  CHECK_GUEST_RAM: 'avd.checkGuestRam',
   // Capture
   CAPTURE_DIRECTORY: 'captureDirectory',
   CAPTURE_OPEN_AFTER: 'capture.openAfterCapture',
@@ -85,6 +92,8 @@ export const CONFIG = {
   CAPTURE_MAX_ASPECT_RATIO: 'capture.maxAspectRatio',
   CAPTURE_FONT_SCALES: 'capture.fontScales',
   CAPTURE_LOCALES: 'capture.locales',
+  CAPTURE_TABLET_TRICK: 'capture.tabletTrickForLandscape',
+  CAPTURE_DETECT_LEFTOVERS: 'capture.detectLeftoverOverrides',
   // Demo mode
   DEMO_CLOCK: 'demoMode.clock',
   DEMO_BATTERY_LEVEL: 'demoMode.batteryLevel',
@@ -249,6 +258,77 @@ export const LAUNCH_PREFLIGHT = {
   TOP_PROCESS_COUNT: 4,
   PROCESS_QUERY_TIMEOUT_MS: 2500,
   ACCEL_CHECK_TIMEOUT_MS: 8000,
+} as const;
+
+/**
+ * Guest RAM floors — how much memory Android itself needs inside the VM.
+ *
+ * Distinct from LAUNCH_PREFLIGHT, which asks whether the *host* can spare the
+ * AVD's configured RAM. This asks whether that configured RAM is enough for the
+ * system image at all. A modern Play/Google-APIs image on 1536 MB boots, then
+ * sits at ~100 MB free, swaps, and ANRs ("System UI isn't responding") — which
+ * looks like a broken app rather than an under-provisioned device.
+ */
+export const RAM_RULES = {
+  /** API 33+ with Google APIs or Play Store. Below this the guest thrashes. */
+  GMS_MIN_RAM_MB: 2560,
+  /** AOSP images carry no Play services and boot comfortably on less. */
+  AOSP_MIN_RAM_MB: 1536,
+  /** Google-APIs images below this API predate the memory growth. */
+  GMS_MIN_API: 33,
+  /** vm.heapSize written alongside a RAM repair, as a fraction of ramSize. */
+  HEAP_FRACTION: 1 / 8,
+  /** Floor and ceiling for the derived vm.heapSize, MB. */
+  MIN_HEAP_MB: 192,
+  MAX_HEAP_MB: 512,
+} as const;
+
+/**
+ * Boot-readiness watch.
+ *
+ * `adb devices` reports state=device as soon as the emulator's console port is
+ * up, which is long before Android is usable — the shell can still return
+ * "Broken pipe" from package manager. These govern the real readiness probe.
+ */
+export const BOOT_WATCH = {
+  /** Default ceiling on the boot wait. A cold boot after -wipe-data is slow. */
+  DEFAULT_TIMEOUT_SEC: 180,
+  /** Gap between readiness probes. */
+  POLL_MS: 2000,
+  /** How long to wait for `adb emu kill` to actually drop the device. */
+  STOP_VERIFY_MS: 10000,
+  STOP_POLL_MS: 500,
+} as const;
+
+/** SystemUI overlay categories used for cutout and navigation-bar emulation. */
+export const OVERLAY_CATEGORIES = {
+  CUTOUT: 'com.android.internal.display.cutout.emulation',
+  NAVBAR: 'com.android.internal.systemui.navbar',
+} as const;
+
+/** Display-cutout emulation overlays. `cutout` is the value shown in the picker. */
+export const CUTOUT_MODES: { id: string; label: string; description: string; pkg?: string }[] = [
+  { id: 'none', label: 'None', description: 'No cutout — the default display' },
+  { id: 'corner', label: 'Corner', description: 'Corner cutout', pkg: `${OVERLAY_CATEGORIES.CUTOUT}.corner` },
+  { id: 'double', label: 'Double', description: 'Cutouts on both edges', pkg: `${OVERLAY_CATEGORIES.CUTOUT}.double` },
+  { id: 'hole', label: 'Punch Hole', description: 'Hole-punch camera', pkg: `${OVERLAY_CATEGORIES.CUTOUT}.hole` },
+  { id: 'tall', label: 'Tall', description: 'Tall notch', pkg: `${OVERLAY_CATEGORIES.CUTOUT}.tall` },
+  { id: 'waterfall', label: 'Waterfall', description: 'Curved waterfall edges', pkg: `${OVERLAY_CATEGORIES.CUTOUT}.waterfall` },
+];
+
+/** Navigation-bar mode emulation overlays. */
+export const NAVBAR_MODES: { id: string; label: string; description: string; pkg: string }[] = [
+  { id: 'gestural', label: 'Gesture Navigation', description: 'Full-screen gestures (Android 10+ default)', pkg: `${OVERLAY_CATEGORIES.NAVBAR}.gestural` },
+  { id: 'twobutton', label: '2-Button Navigation', description: 'Pill and back button (Android 9)', pkg: `${OVERLAY_CATEGORIES.NAVBAR}.twobutton` },
+  { id: 'threebutton', label: '3-Button Navigation', description: 'Back, home, and recents', pkg: `${OVERLAY_CATEGORIES.NAVBAR}.threebutton` },
+];
+
+/** Minimum API levels for the overlay-based emulation commands. */
+export const OVERLAY_MIN_API = {
+  /** Cutout emulation overlays ship from Android 9. */
+  CUTOUT: 28,
+  /** Gestural navigation, and the navbar overlay set, ship from Android 10. */
+  NAVBAR: 29,
 } as const;
 
 /** Returns the appropriate system image ABI for the current machine */

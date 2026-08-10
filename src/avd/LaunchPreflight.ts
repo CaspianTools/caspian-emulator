@@ -49,7 +49,7 @@ function describeProcesses(procs: HostProcess[]): string {
 }
 
 /** Find a Gradle wrapper in any open workspace folder. */
-function findGradleWrapper(): { dir: string; script: string } | undefined {
+export function findGradleWrapper(): { dir: string; script: string } | undefined {
   const script = process.platform === 'win32' ? 'gradlew.bat' : 'gradlew';
   for (const folder of vscode.workspace.workspaceFolders || []) {
     const candidate = path.join(folder.uri.fsPath, script);
@@ -60,7 +60,7 @@ function findGradleWrapper(): { dir: string; script: string } | undefined {
   return undefined;
 }
 
-function stopGradleDaemons(wrapper: { dir: string; script: string }): Promise<void> {
+export function stopGradleDaemons(wrapper: { dir: string; script: string }): Promise<void> {
   return new Promise((resolve, reject) => {
     execFile(wrapper.script, ['--stop'], { cwd: wrapper.dir, timeout: 30000, windowsHide: true }, (err) => {
       if (err) { reject(err); } else { resolve(); }
@@ -155,10 +155,37 @@ async function presentMemoryWarning(
 
   // 'tight' is a non-modal toast: dismissing it must not eat the launch.
   if (verdict.verdict === 'tight') {
+    // Offer the daemon remedy here too, not only at 'insufficient'. A resident
+    // Gradle daemon plus an emulator fits at launch and then stops fitting the
+    // moment a build starts — which is the common way this actually goes wrong.
+    const procs = await getTopMemoryConsumers();
+    const wrapper = procs.some(p => p.label === 'Gradle daemon' || p.label === 'Kotlin compile daemon')
+      ? findGradleWrapper()
+      : undefined;
+
     const choice = await vscode.window.showWarningMessage(
       `Memory is tight for "${avdName}" — ${formatMb(verdict.availableMb)} free, ~${formatMb(verdict.requiredMb)} needed.`,
-      'Launch Anyway', "Don't Warn Again",
+      ...(wrapper ? ['Stop Gradle Daemons'] : []),
+      'Launch Anyway',
+      "Don't Warn Again",
     );
+    if (choice === 'Stop Gradle Daemons' && wrapper) {
+      try {
+        await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: 'Stopping Gradle daemons...', cancellable: false },
+          () => stopGradleDaemons(wrapper),
+        );
+        const after = await remeasure();
+        const freed = after.availableMb - verdict.availableMb;
+        if (freed > 0) {
+          vscode.window.showInformationMessage(
+            `Freed ${formatMb(freed)}. Now ${formatMb(after.availableMb)} available.`,
+          );
+        }
+      } catch (err) {
+        vscode.window.showWarningMessage(`Could not stop Gradle daemons: ${err}`);
+      }
+    }
     if (choice === "Don't Warn Again") {
       await cfg.update(CONFIG.CHECK_HOST_MEMORY, false, vscode.ConfigurationTarget.Global);
     }

@@ -29,6 +29,10 @@ export interface AvdInfo {
   ramMb: number;
   /** Precomputed by getAvdInfo so the tree stays synchronous. */
   displayHealthy: boolean;
+  /** False when hw.ramSize is below what the system image needs. */
+  ramHealthy: boolean;
+  /** Guest RAM floor for this image in MB, 0 when the image is unknown. */
+  ramFloorMb: number;
   /** "1280×2856" or "no display config" */
   displaySummary: string;
   /** Short reason shown in the tooltip when the display is unhealthy. */

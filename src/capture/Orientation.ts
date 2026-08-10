@@ -54,6 +54,27 @@ export function orientationOf(width: number, height: number): Orientation {
   return height > width ? 'portrait' : 'landscape';
 }
 
+export function flipOrientation(o: Orientation): Orientation {
+  return o === 'portrait' ? 'landscape' : 'portrait';
+}
+
+/**
+ * What a given user_rotation should look like on this device.
+ *
+ * user_rotation is relative to the device's *natural* orientation, which is
+ * landscape on tablets and most foldables. Assuming rotation 0 means portrait
+ * mislabels every tablet capture, so the natural orientation has to be measured
+ * once and threaded through.
+ */
+export function expectedOrientation(natural: Orientation, rotation: 0 | 1 | 2 | 3): Orientation {
+  return rotation % 2 === 1 ? flipOrientation(natural) : natural;
+}
+
+/** The rotation that yields `target` on a device whose natural side is `natural`. */
+export function rotationForOrientation(natural: Orientation, target: Orientation): 0 | 1 {
+  return target === natural ? 0 : 1;
+}
+
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export interface RotationSnapshot {

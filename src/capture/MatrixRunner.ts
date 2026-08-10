@@ -1,8 +1,9 @@
 import * as vscode from 'vscode';
 import { AdbClient } from '../adb/AdbClient';
 import { CaptureResult, CaptureService } from './CaptureService';
-import { CaptureCancelledError, Orientation } from './Orientation';
+import { CaptureCancelledError, Orientation, rotationForOrientation } from './Orientation';
 import { resolveRunDirectory } from './CapturePaths';
+import { DemoModeController } from './DemoMode';
 import { Logger } from '../utils/Logger';
 
 /**
@@ -49,12 +50,12 @@ export function countCells(dims: MatrixDimensions): number {
     * Math.max(1, dims.orientations.length);
 }
 
-const ROTATION_FOR: Record<Orientation, 0 | 1> = { portrait: 0, landscape: 1 };
-
 export class MatrixRunner {
   constructor(
     private adb: AdbClient,
     private capture: CaptureService,
+    /** Present when a run is in screenshot mode, so it can be re-applied. */
+    private demo?: DemoModeController,
   ) {}
 
   /**
@@ -101,6 +102,18 @@ export class MatrixRunner {
     let appliedFontScale: number | undefined;
     let index = 0;
 
+    // Measured once, before the density axis starts moving: user_rotation is
+    // relative to the device's natural orientation, which is landscape on
+    // tablets and foldables. Mapping portrait→0 unconditionally mislabels them.
+    let natural: Orientation;
+    try {
+      natural = await this.capture.detectNaturalOrientation(ctx.serial, token);
+    } catch (err) {
+      if (err instanceof CaptureCancelledError) { throw err; }
+      natural = 'portrait';
+      notes.push(`Could not measure the device's natural orientation (${err instanceof Error ? err.message : err}); assuming portrait.`);
+    }
+
     for (const density of densities) {
       if (density !== appliedDensity) {
         if (density === undefined) {
@@ -109,6 +122,16 @@ export class MatrixRunner {
           await this.adb.setWmDensity(ctx.serial, density);
         }
         appliedDensity = density;
+
+        // A density change restarts SystemUI, which drops demo mode — leaving
+        // the status bar half real and half faked, with duplicated icons.
+        if (this.demo) {
+          try {
+            await this.demo.reapply(ctx.serial);
+          } catch (err) {
+            notes.push(`Could not re-apply screenshot mode after the density change: ${err instanceof Error ? err.message : err}`);
+          }
+        }
       }
 
       for (const locale of locales) {
@@ -159,15 +182,23 @@ export class MatrixRunner {
               continue;
             }
 
-            const result = await this.capture.captureCell(ctx.serial, ROTATION_FOR[orientation], {
-              runDir,
-              deviceLabel: ctx.deviceLabel,
-              index: index + 1,
-              locale,
-              fontScale,
-              density,
-              token,
-            });
+            const result = await this.capture.captureCell(
+              ctx.serial,
+              rotationForOrientation(natural, orientation),
+              {
+                runDir,
+                deviceLabel: ctx.deviceLabel,
+                index: index + 1,
+                locale,
+                fontScale,
+                density,
+                token,
+                expect: orientation,
+              },
+            );
+            if (result.orientation !== orientation) {
+              notes.push(`${label}: requested ${orientation} but captured ${result.orientation}.`);
+            }
             results.push(result);
             index++;
           }
