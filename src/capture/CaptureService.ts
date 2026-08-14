@@ -22,6 +22,7 @@ import {
   resolveRunDirectory,
 } from './CapturePaths';
 import { DemoModeController } from './DemoMode';
+import { FrameContentCheck, checkFrameContent } from './FrameContent';
 import { Logger } from '../utils/Logger';
 
 /** Smallest-width in dp at which the Pixel launcher permits landscape. */
@@ -82,6 +83,30 @@ export function validatePlayAsset(width: number, height: number, maxRatio: numbe
     return { level: 'warn', issues: play.reasons, ratio };
   }
   return { level: 'pass', issues: [], ratio };
+}
+
+/**
+ * Fold a blank-frame verdict into a geometry validation, in place.
+ *
+ * A featureless frame is always a failure regardless of how well-formed it is,
+ * and the message has to name the remedy: nothing else in the product will
+ * connect "black screenshot" to "GPU mode".
+ */
+export function applyBlankCheck(
+  validation: AssetValidation,
+  content: FrameContentCheck,
+  file?: string,
+): void {
+  if (!content.blank) { return; }
+  const message = `${capitalize(content.reason || 'the captured frame appears blank')}. `
+    + `Set "${CONFIG.SECTION}.${CONFIG.EMULATOR_GPU_MODE}" to "swiftshader" and relaunch the emulator.`;
+  validation.issues.unshift(message);
+  validation.level = 'fail';
+  Logger.warn(`${file ? `${file}: ` : ''}${message}`);
+}
+
+function capitalize(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
 export interface CaptureCellContext {
@@ -245,6 +270,10 @@ export class CaptureService {
 
     const validation = validatePlayAsset(frame.width, frame.height, this.maxAspectRatio());
     const warnings = frame.warning ? [frame.warning] : [];
+
+    // Geometry can be perfect on a frame that carries no image at all. Checked
+    // after the write so the evidence is on disk to look at.
+    applyBlankCheck(validation, checkFrameContent(frame.buf, frame.width, frame.height), file);
 
     if (ctx.expect && frame.orientation !== ctx.expect) {
       const message = `Requested ${ctx.expect} but the screen stayed ${frame.orientation} `

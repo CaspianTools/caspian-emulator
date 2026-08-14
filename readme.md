@@ -32,7 +32,7 @@ No Android Studio. No manual path configuration. Just install the extension and 
 
 ### AVD Management
 - Create virtual devices by name — pick **Pixel 9 Pro**, **Pixel 8**, **Pixel Fold**, **Pixel Tablet**, and more from a preset list
-- System image downloaded automatically if not installed (~1 GB)
+- System image downloaded automatically if not installed (~1 GB) — and if you already have a **newer** one, that is used instead of downloading an older one
 - Launch, stop, delete, clone, and edit AVDs from the sidebar
 - **Cold boot** option — launch without loading snapshots
 - **Clone AVD** — duplicate an existing virtual device for testing variations
@@ -40,7 +40,7 @@ No Android Studio. No manual path configuration. Just install the extension and 
 - See running/stopped status at a glance with color-coded icons
 - **Correct hardware, always** — presets carry the real resolution, density, and RAM of the device they name, even when your SDK's command-line tools predate that device profile
 - **Resolution shown in the sidebar**, with a warning icon and one-click repair for any misconfigured virtual device
-- **Low-memory pre-flight** — warns before a launch that would hang, names the processes eating your RAM, and offers to stop Gradle daemons
+- **Low-memory pre-flight** — warns before a launch that would hang, names the processes eating your RAM, and offers to stop the build daemons holding it. If `gradlew --stop` frees nothing (it cannot stop the Kotlin compile daemon, usually the larger of the two) Caspian says so and offers to stop what is left, rather than going quiet and letting you assume it worked
 - **Acceleration check** — tells you when WHPX/HAXM/KVM is missing instead of letting the emulator hang in software mode
 - **Launch failures are reported** with a link to the emulator log, rather than a progress bar that spins and gives up
 - **Boot is tracked properly** — Caspian waits for Android itself (`sys.boot_completed` plus a working package manager), not just for the device to appear in `adb devices`, and tells you whether it is waiting, booting, or stalled
@@ -49,12 +49,14 @@ No Android Studio. No manual path configuration. Just install the extension and 
 - **Stopping is verified**, and a force kill warns you that it costs the snapshot before it happens
 - **Guest RAM check** — flags a virtual device with too little RAM for its system image, the cause of an emulator that boots and then stops responding
 - **Host memory is watched while the emulator runs**, so a build started alongside it warns you before the guest starts thrashing
+- **GPU mode is a setting** (`caspian.emulator.gpuMode`), not something to hand-type into launch arguments — and when a launch dies with a graphics error, Caspian retries in software automatically, names the mode that worked, and offers to save it
 - Custom emulator launch arguments via settings
 
 ### Store Screenshots & Release Assets
 - **Screenshot mode** — one toggle for a clean status bar: fixed clock, full battery, full signal, no notification icons. No more hand-typing seven `am broadcast` commands
 - **Capture Store Screenshots** — portrait and landscape in one command, saved to a named run folder
 - Every capture is **validated against Play Console rules** (320-3840 px per side, aspect limits) so you learn about a rejection here, not in the Play Console
+- **A blank capture fails loudly.** An emulator can boot, run your app, and still hand back a perfectly formed, entirely black PNG — correct size, correct aspect, correct format, and worthless. Caspian measures the image itself and tells you the emulator is not rendering, instead of letting black rectangles reach your store listing
 - Each run writes a **Markdown report** with the images inline, plus a `manifest.json` for scripting
 - Orientation is labelled from the captured image, so tablets and foldables are correct, and an orientation-locked app is reported rather than silently duplicated
 - **A rotation that did not happen fails validation** instead of being quietly filed under whichever orientation it measured
@@ -138,7 +140,7 @@ Browse the device filesystem from the sidebar:
 ### Install
 Search **"Caspian Emulator"** in the VS Code Extensions panel, or:
 ```bash
-code --install-extension caspian-emulator-1.2.0.vsix
+code --install-extension caspian-emulator-1.3.0.vsix
 ```
 
 ### First Launch
@@ -184,6 +186,9 @@ All settings are under the `caspian` namespace. Open VS Code Settings and search
 | `caspian.avd.playStoreStrictAspect` | boolean | `false` | Enforce Play's documented 16:9 rule. Most modern phones are taller. |
 | `caspian.captureDirectory` | string | `"${workspaceFolder}/.caspian/captures"` | Where capture runs are saved. Supports `${workspaceFolder}` and `~`. |
 | `caspian.capture.openAfterCapture` | boolean | `true` | Open the report when a capture run finishes. |
+| `caspian.emulator.gpuMode` | string | `"auto"` | GPU rendering mode passed as `-gpu`. Use `swiftshader` if screenshots come out black. |
+| `caspian.emulator.gpuFallback` | boolean | `true` | Retry with software rendering when a launch fails with a graphics error. |
+| `caspian.avd.preferInstalledSystemImage` | boolean | `true` | Use the newest installed system image at or above a preset's API level instead of downloading the exact one. |
 | `caspian.capture.useDemoMode` | boolean | `true` | Use screenshot mode during capture runs. |
 | `caspian.capture.settleDelayMs` | number | `500` | Extra delay after the screen stops changing, before capturing. |
 | `caspian.capture.maxAspectRatio` | number | `2` | Maximum long/short ratio accepted when validating captures. |

@@ -61,6 +61,7 @@ src/
 ├── capture/
 │   ├── CapturePaths.ts            — Capture directory resolver, run folders, filenames
 │   ├── DemoMode.ts                — SystemUI demo mode (screenshot mode) controller
+│   ├── FrameContent.ts            — Blank-frame detection (size gate + PNG pixel sampling)
 │   ├── DeviceState.ts             — Device setting snapshot/restore + crash recovery
 │   ├── Orientation.ts             — Rotation control, settle detection, PNG header parsing
 │   ├── SystemUiOverlay.ts         — Display-cutout and navigation-bar emulation overlays

@@ -1,4 +1,5 @@
 import { AdbClient } from '../adb/AdbClient';
+import { DISPLAY_RULES } from '../constants';
 import { Logger } from '../utils/Logger';
 
 /**
@@ -115,8 +116,16 @@ export interface WaitOptions {
   token?: CancellationLike;
 }
 
-/** A config change briefly blanks the screen; an all-black PNG compresses tiny. */
-const MIN_PLAUSIBLE_PNG_BYTES = 10 * 1024;
+/**
+ * A config change briefly blanks the screen, so one blank frame is worth a
+ * retry. Measured per pixel rather than as a flat byte floor: the old 10 KB
+ * threshold worked out to 0.0049 B/px at 1080x1920, which is *below* a real
+ * all-black frame, so it never caught the thing it was written for.
+ */
+function looksBlank(buf: Buffer, width: number, height: number): boolean {
+  const pixels = width * height;
+  return pixels > 0 && buf.length / pixels < DISPLAY_RULES.MIN_BYTES_PER_PIXEL;
+}
 
 /**
  * Wait until the screen stops changing, then capture it.
@@ -158,13 +167,23 @@ export async function waitForStableScreen(
     if (orientationOk && stable) {
       await delay(tailMs);
       let final = await adb.captureScreenshotBuffer(serial);
-      if (final.length < MIN_PLAUSIBLE_PNG_BYTES) {
-        Logger.warn(`Captured a suspiciously small frame (${final.length} bytes) on ${serial}; retrying once.`);
+      let size = pngSize(final);
+      if (looksBlank(final, size.width, size.height)) {
+        Logger.warn(`Captured a suspiciously empty frame (${final.length} bytes) on ${serial}; retrying once.`);
         await delay(tailMs);
         final = await adb.captureScreenshotBuffer(serial);
+        size = pngSize(final);
       }
-      const size = pngSize(final);
-      return { buf: final, ...size, orientation: orientationOf(size.width, size.height) };
+      return {
+        buf: final,
+        ...size,
+        orientation: orientationOf(size.width, size.height),
+        // Still empty after the retry: this is not a transition artefact, and
+        // returning it silently is how a black PNG reaches a store listing.
+        warning: looksBlank(final, size.width, size.height)
+          ? 'The screen is still empty after a retry — the emulator may not be rendering.'
+          : undefined,
+      };
     }
 
     last = { w: width, h: height, len: buf.length };

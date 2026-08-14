@@ -580,14 +580,38 @@ export class AvdManager {
     return emulatorProc;
   }
 
+  /**
+   * Patterns that mean the emulator died trying to set up rendering.
+   *
+   * Kept separate from the generic fatal list because these are the only
+   * failures worth retrying with a different -gpu mode. The Qt one is what a
+   * Windows host with a broken GL driver actually prints, and it matches none
+   * of the generic patterns below — it carries no PANIC:/ERROR: prefix, so
+   * before this it presented as a hang with no diagnosis.
+   */
+  private static readonly GRAPHICS_LOG_PATTERNS: RegExp[] = [
+    /UpdateLayeredWindowIndirect failed/i,
+    /Could not initialize (?:Open)?GL(?:ES)? emulation/i,
+    /Failed to (?:initialize|create) (?:EGL|GL|OpenGL|renderer|the GPU)/i,
+    /(?:emuglConfig_init|initOpenglesEmulation) failed/i,
+    /No OpenGL ES (?:driver|renderer) (?:found|available)/i,
+    /gpu (?:mode|emulation) .*(?:not supported|unavailable|failed)/i,
+  ];
+
   /** Fatal patterns that mean the emulator will never finish booting. */
   private static readonly FATAL_LOG_PATTERNS: RegExp[] = [
+    ...AvdManager.GRAPHICS_LOG_PATTERNS,
     /^PANIC:\s*(.+)$/m,
     /^ERROR:\s*(.+)$/m,
     /x86 emulation currently requires hardware acceleration/i,
     /^emulator: ERROR: (.+)$/m,
     /Failed to (?:open|create|load) .+/i,
   ];
+
+  /** Whether a failure string is one a different -gpu mode might survive. */
+  static isGraphicsFailure(text: string): boolean {
+    return AvdManager.GRAPHICS_LOG_PATTERNS.some(p => p.test(text));
+  }
 
   /**
    * Scan an AVD's launch log for a fatal error. Returns the first match, so a

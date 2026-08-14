@@ -12,6 +12,8 @@ import {
   formatMb,
   getHostMemory,
   getTopMemoryConsumers,
+  killBuildDaemons,
+  residentBuildDaemons,
 } from '../utils/HostResources';
 import { Logger } from '../utils/Logger';
 
@@ -48,6 +50,14 @@ function describeProcesses(procs: HostProcess[]): string {
   return `\n\nTop memory users:\n${lines.join('\n')}`;
 }
 
+/**
+ * Label for the daemon remedy action.
+ *
+ * "Build" rather than "Gradle": the remedy now also stops the Kotlin compile
+ * daemon, which is usually the one actually holding the memory.
+ */
+const STOP_DAEMONS = 'Stop Build Daemons';
+
 /** Find a Gradle wrapper in any open workspace folder. */
 export function findGradleWrapper(): { dir: string; script: string } | undefined {
   const script = process.platform === 'win32' ? 'gradlew.bat' : 'gradlew';
@@ -66,6 +76,107 @@ export function stopGradleDaemons(wrapper: { dir: string; script: string }): Pro
       if (err) { reject(err); } else { resolve(); }
     });
   });
+}
+
+/**
+ * Re-read available memory once the OS has caught up with a process exit.
+ *
+ * Both `gradlew --stop` and `process.kill` return before the processes are
+ * actually gone, so an immediate sample still shows the memory held and the
+ * remedy reports failure it did not have. Poll briefly and keep the best
+ * reading: memory is being released, so the maximum is the truest value.
+ */
+async function measureAfterTeardown(): Promise<number> {
+  let best = (await getHostMemory()).availableMb;
+  for (let i = 0; i < DAEMON_SETTLE_SAMPLES; i++) {
+    await new Promise(r => setTimeout(r, DAEMON_SETTLE_MS));
+    const next = (await getHostMemory()).availableMb;
+    if (next > best) { best = next; }
+  }
+  return best;
+}
+
+/** Poll cadence for measureAfterTeardown: 4 samples over ~2 seconds. */
+const DAEMON_SETTLE_MS = 500;
+const DAEMON_SETTLE_SAMPLES = 4;
+
+/**
+ * Run the "stop the build daemons" remedy and report what it actually achieved.
+ *
+ * Two things this must not do. It must not infer success from the exit code:
+ * `gradlew --stop` exits 0 having stopped nothing. And it must not stay silent
+ * when nothing was freed — silence after a remedy reads as success, which is
+ * worse than offering no remedy at all, because the user concludes memory is no
+ * longer the problem and goes looking somewhere else.
+ *
+ * `gradlew --stop` reaches the Gradle daemon registry only. A Kotlin compile
+ * daemon holding a gigabyte survives it, so when memory does not move, offer to
+ * terminate whatever is still resident by pid.
+ *
+ * Returns the memory available afterwards, so callers can re-evaluate.
+ */
+export async function runDaemonRemedy(
+  wrapper: { dir: string; script: string } | undefined,
+  beforeMb: number,
+): Promise<number> {
+  if (wrapper) {
+    try {
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'Stopping Gradle daemons...', cancellable: false },
+        () => stopGradleDaemons(wrapper),
+      );
+    } catch (err) {
+      vscode.window.showWarningMessage(`Could not stop Gradle daemons: ${err}`);
+    }
+  }
+
+  let availableMb = await measureAfterTeardown();
+  if (availableMb - beforeMb > 0) {
+    vscode.window.showInformationMessage(
+      `Freed ${formatMb(availableMb - beforeMb)}. Now ${formatMb(availableMb)} available.`,
+    );
+    return availableMb;
+  }
+
+  // Nothing moved. Name what is still holding the memory.
+  const survivors = residentBuildDaemons(await getTopMemoryConsumers());
+  if (survivors.length === 0) {
+    vscode.window.showWarningMessage(
+      `${wrapper ? '"gradlew --stop" freed no memory' : 'No memory was freed'} — `
+      + `still ${formatMb(availableMb)} available. No build daemons are left to stop.`,
+    );
+    return availableMb;
+  }
+
+  const held = survivors.reduce((sum, p) => sum + p.mb, 0);
+  const names = survivors.map(p => `${p.label}${p.count > 1 ? ` ×${p.count}` : ''} (${formatMb(p.mb)})`).join(', ');
+  const choice = await vscode.window.showWarningMessage(
+    `"gradlew --stop" freed no memory — ${names} ${survivors.length > 1 ? 'are' : 'is'} still running, `
+    + `holding ${formatMb(held)}.`,
+    'Stop Remaining Build Daemons',
+    'Show Details',
+  );
+
+  if (choice === 'Show Details') {
+    Logger.show();
+  } else if (choice === 'Stop Remaining Build Daemons') {
+    const { killed, failed } = killBuildDaemons(survivors);
+    availableMb = await measureAfterTeardown();
+    const freed = availableMb - beforeMb;
+    if (freed > 0) {
+      vscode.window.showInformationMessage(
+        `Stopped ${killed} build daemon${killed === 1 ? '' : 's'}, freeing ${formatMb(freed)}. `
+        + `Now ${formatMb(availableMb)} available.`,
+      );
+    } else {
+      vscode.window.showWarningMessage(
+        `Stopped ${killed} build daemon${killed === 1 ? '' : 's'}${failed ? ` (${failed} could not be stopped)` : ''}, `
+        + `but memory has not recovered — still ${formatMb(availableMb)} available.`,
+      );
+    }
+  }
+
+  return availableMb;
 }
 
 /**
@@ -159,32 +270,21 @@ async function presentMemoryWarning(
     // Gradle daemon plus an emulator fits at launch and then stops fitting the
     // moment a build starts — which is the common way this actually goes wrong.
     const procs = await getTopMemoryConsumers();
-    const wrapper = procs.some(p => p.label === 'Gradle daemon' || p.label === 'Kotlin compile daemon')
-      ? findGradleWrapper()
-      : undefined;
+    // Gated on a daemon being resident, not on finding a wrapper: without a
+    // wrapper the remedy skips `gradlew --stop` and terminates by pid instead,
+    // which is the only thing that clears a Kotlin daemon anyway.
+    const hasDaemon = procs.some(p => p.label === 'Gradle daemon' || p.label === 'Kotlin compile daemon');
+    const wrapper = hasDaemon ? findGradleWrapper() : undefined;
 
     const choice = await vscode.window.showWarningMessage(
       `Memory is tight for "${avdName}" — ${formatMb(verdict.availableMb)} free, ~${formatMb(verdict.requiredMb)} needed.`,
-      ...(wrapper ? ['Stop Gradle Daemons'] : []),
+      ...(hasDaemon ? [STOP_DAEMONS] : []),
       'Launch Anyway',
       "Don't Warn Again",
     );
-    if (choice === 'Stop Gradle Daemons' && wrapper) {
-      try {
-        await vscode.window.withProgress(
-          { location: vscode.ProgressLocation.Notification, title: 'Stopping Gradle daemons...', cancellable: false },
-          () => stopGradleDaemons(wrapper),
-        );
-        const after = await remeasure();
-        const freed = after.availableMb - verdict.availableMb;
-        if (freed > 0) {
-          vscode.window.showInformationMessage(
-            `Freed ${formatMb(freed)}. Now ${formatMb(after.availableMb)} available.`,
-          );
-        }
-      } catch (err) {
-        vscode.window.showWarningMessage(`Could not stop Gradle daemons: ${err}`);
-      }
+    if (choice === STOP_DAEMONS) {
+      await runDaemonRemedy(wrapper, verdict.availableMb);
+      await remeasure();
     }
     if (choice === "Don't Warn Again") {
       await cfg.update(CONFIG.CHECK_HOST_MEMORY, false, vscode.ConfigurationTarget.Global);
@@ -198,9 +298,13 @@ async function presentMemoryWarning(
     const detail = buildDetail(current, procs);
     Logger.warn(`Launch pre-flight for ${avdName}:\n${detail}`);
 
-    const wrapper = procs.some(p => p.label === 'Gradle daemon') ? findGradleWrapper() : undefined;
+    // Both daemon kinds, matching the 'tight' tier above: a machine with a
+    // resident Kotlin daemon and no Gradle daemon was offered the remedy on the
+    // mild warning and not on this, the severe one.
+    const hasDaemon = procs.some(p => p.label === 'Gradle daemon' || p.label === 'Kotlin compile daemon');
+    const wrapper = hasDaemon ? findGradleWrapper() : undefined;
     const actions = [
-      ...(wrapper ? ['Stop Gradle Daemons'] : []),
+      ...(hasDaemon ? [STOP_DAEMONS] : []),
       'Launch Anyway',
       'Show Details',
       "Don't Warn Again",
@@ -212,23 +316,9 @@ async function presentMemoryWarning(
       ...actions,
     );
 
-    if (choice === 'Stop Gradle Daemons' && wrapper) {
-      try {
-        await vscode.window.withProgress(
-          { location: vscode.ProgressLocation.Notification, title: 'Stopping Gradle daemons...', cancellable: false },
-          () => stopGradleDaemons(wrapper),
-        );
-      } catch (err) {
-        vscode.window.showWarningMessage(`Could not stop Gradle daemons: ${err}`);
-      }
-      const before = current.availableMb;
+    if (choice === STOP_DAEMONS) {
+      await runDaemonRemedy(wrapper, current.availableMb);
       current = await remeasure();
-      const freed = current.availableMb - before;
-      if (freed > 0) {
-        vscode.window.showInformationMessage(
-          `Freed ${formatMb(freed)}. Now ${formatMb(current.availableMb)} available.`,
-        );
-      }
       if (current.verdict === 'ok') { return true; }
       continue;   // re-present with the updated numbers
     }

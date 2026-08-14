@@ -17,6 +17,15 @@ type ProgressCallback = (p: DownloadProgress) => void;
 export class SdkDownloader {
   private sdkRoot: string;
 
+  /**
+   * The image installComponents actually downloaded.
+   *
+   * Resolved once and reused by createDefaultAvd: querying twice would risk
+   * downloading one image and creating the AVD against another, which fails
+   * with a confusing "package path is not valid" at the very end of setup.
+   */
+  private resolvedSystemImage: string | undefined;
+
   constructor(sdkRoot?: string) {
     this.sdkRoot = sdkRoot || SdkDownloader.getDefaultInstallPath();
   }
@@ -36,11 +45,72 @@ export class SdkDownloader {
     return this.sdkRoot;
   }
 
-  /** Get the correct system image ABI for the current platform */
-  static getDefaultSystemImage(): string {
+  /** The ABI whose system images run natively on this host. */
+  static getSystemImageAbi(): string {
     const arch = os.arch();
-    const abi = (process.platform === 'darwin' && arch === 'arm64') ? 'arm64-v8a' : 'x86_64';
-    return `system-images;android-35;google_apis;${abi}`;
+    return (process.platform === 'darwin' && arch === 'arm64') ? 'arm64-v8a' : 'x86_64';
+  }
+
+  /**
+   * Offline fallback image.
+   *
+   * Only used when `sdkmanager --list` cannot be read. Prefer
+   * resolveLatestSystemImage, which asks the SDK what it actually offers
+   * instead of shipping a number that goes stale every Android release.
+   */
+  static getDefaultSystemImage(): string {
+    return `system-images;android-${SDK_DOWNLOAD.FALLBACK_API_LEVEL};google_apis;${SdkDownloader.getSystemImageAbi()}`;
+  }
+
+  /**
+   * Ask the SDK for the newest stable Google APIs image it can install.
+   *
+   * The `android-(\d+)` anchor is doing real work: it rejects the `-ext`
+   * sidegrade packages and the preview codename channels, both of which sort
+   * unhelpfully and neither of which is what a first-run user wants.
+   *
+   * Never throws — a probe failure degrades to the pinned fallback.
+   */
+  static async resolveLatestSystemImage(sdkmanagerPath: string): Promise<string> {
+    const abi = SdkDownloader.getSystemImageAbi();
+    const fallback = SdkDownloader.getDefaultSystemImage();
+
+    try {
+      const stdout = await new Promise<string>((resolve, reject) => {
+        // sdkmanager is a .bat on Windows, which needs a shell to run at all —
+        // and a shell means the path must be quoted, or an SDK under a user
+        // folder with a space in it splits into two arguments.
+        // Node warns when an args array is combined with shell:true, so on
+        // Windows the flag goes into the command string itself. It is a
+        // constant, so there is nothing to escape.
+        const isWin = process.platform === 'win32';
+        execFile(
+          isWin ? `"${sdkmanagerPath}" --list` : sdkmanagerPath,
+          isWin ? [] : ['--list'],
+          { timeout: 120000, maxBuffer: 32 * 1024 * 1024, windowsHide: true, shell: isWin },
+          (err, out) => {
+            // sdkmanager exits non-zero on warnings while still listing.
+            if (err && !out) { reject(err); } else { resolve(out || ''); }
+          },
+        );
+      });
+
+      const pattern = new RegExp(`system-images;android-(\\d+);google_apis;${abi}(?![\\w-])`, 'g');
+      let best = 0;
+      for (const m of stdout.matchAll(pattern)) {
+        const api = parseInt(m[1], 10);
+        if (Number.isFinite(api) && api > best) { best = api; }
+      }
+      // Whatever the SDK offers wins, even if it is older than the pinned
+      // fallback: an image that exists beats one that does not.
+      if (best > 0) {
+        return `system-images;android-${best};google_apis;${abi}`;
+      }
+    } catch {
+      /* fall through to the pinned image */
+    }
+
+    return fallback;
   }
 
   /** Detect Java 17+ installation */
@@ -259,7 +329,9 @@ export class SdkDownloader {
 
   /** Install SDK components via sdkmanager */
   async installComponents(sdkmanagerPath: string, progress: ProgressCallback): Promise<void> {
-    const systemImage = SdkDownloader.getDefaultSystemImage();
+    progress({ message: 'Checking which Android versions are available...' });
+    const systemImage = await SdkDownloader.resolveLatestSystemImage(sdkmanagerPath);
+    this.resolvedSystemImage = systemImage;
 
     const packages = [
       { name: 'platform-tools', label: 'Installing platform-tools (adb)...' },
@@ -305,7 +377,8 @@ export class SdkDownloader {
     const avdmanagerPath = path.join(
       this.sdkRoot, 'cmdline-tools', 'latest', 'bin', SDK_TOOLS.AVDMANAGER
     );
-    const systemImage = SdkDownloader.getDefaultSystemImage();
+    // The image installComponents downloaded, not a fresh guess.
+    const systemImage = this.resolvedSystemImage || SdkDownloader.getDefaultSystemImage();
     const avdName = SDK_DOWNLOAD.DEFAULT_AVD_NAME;
 
     return new Promise((resolve, reject) => {

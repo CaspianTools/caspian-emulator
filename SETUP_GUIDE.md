@@ -99,13 +99,37 @@ sdkmanager "platform-tools" "emulator" "cmdline-tools;latest"
 | `caspian.emulator.watchHostMemory` | boolean | `true` | Warn when host memory runs low while an emulator is running |
 | `caspian.emulator.lowMemoryFloorMb` | number | `512` | Free memory below which that warning fires (`0` disables it) |
 | `caspian.avd.checkGuestRam` | boolean | `true` | Flag AVDs with less RAM than their system image needs |
+| `caspian.emulator.gpuMode` | string | `"auto"` | GPU rendering mode (`-gpu`). Set to `swiftshader` if screenshots come out black |
+| `caspian.emulator.gpuFallback` | boolean | `true` | Retry with software rendering when a launch fails with a graphics error |
+| `caspian.avd.preferInstalledSystemImage` | boolean | `true` | Use the newest installed system image at or above a preset's API level |
 | `caspian.avd.playStoreStrictAspect` | boolean | `false` | Enforce Play's documented 16:9 rule |
 | `caspian.captureDirectory` | string | `"${workspaceFolder}/.caspian/captures"` | Where capture runs are written |
 | `caspian.capture.useDemoMode` | boolean | `true` | Use screenshot mode during capture runs |
 | `caspian.capture.maxAspectRatio` | number | `2` | Max long/short ratio accepted when validating captures |
 | `caspian.demoMode.clock` | string | `"1000"` | Clock shown in screenshot mode (24-hour HHMM) |
 
-See the [readme](readme.md#settings) for the full list of 34 settings.
+See the [readme](readme.md#settings) for the full list of 37 settings.
+
+### GPU Rendering Mode
+
+`caspian.emulator.gpuMode` controls the `-gpu` flag the emulator is launched with:
+
+| Mode | What it does |
+|------|-------------|
+| `auto` (default) | No `-gpu` flag; the emulator chooses |
+| `host` | Use the host GPU directly. Fastest, when the host's OpenGL driver works |
+| `swiftshader` | Pure software rendering. Slowest, but always produces a readable frame |
+| `swiftshader_indirect` | Software rendering with an indirect swap chain. Faster, but renders **black** on some hosts |
+| `angle_indirect` | Direct3D via ANGLE. Windows only |
+
+**If your screenshots come out black**, the emulator is running but not rendering — set
+`caspian.emulator.gpuMode` to `swiftshader`. Caspian now detects this itself and says so rather
+than writing a valid, entirely black PNG.
+
+When the mode is `auto`, a launch that dies with a graphics error is retried automatically
+(`auto` → `swiftshader_indirect` → `swiftshader`), once per device per session. Caspian names the
+mode that worked and offers to save it. Set `caspian.emulator.gpuFallback` to `false` to turn that
+off, and note that an explicit `-gpu` in `caspian.emulatorArgs` overrides all of it.
 
 ### Emulator Launch Arguments
 
@@ -120,7 +144,7 @@ Pass custom flags when launching emulators:
 Common flags:
 - `-no-snapshot` — cold boot every time
 - `-no-audio` — disable audio
-- `-gpu swiftshader_indirect` — software rendering (for machines without GPU)
+- `-gpu swiftshader_indirect` — software rendering (prefer the `caspian.emulator.gpuMode` setting)
 - `-memory 2048` — set RAM size
 - `-no-boot-anim` — skip boot animation for faster startup
 
@@ -180,7 +204,7 @@ The extension falls back to `adb shell screencap` which captures screenshots at 
 - Create an AVD using the **+** button in the Virtual Devices panel
 - Or create one via command line:
   ```bash
-  avdmanager create avd -n MyDevice -k "system-images;android-35;google_apis;x86_64"
+  avdmanager create avd -n MyDevice -k "system-images;android-36;google_apis;x86_64"
   ```
 - Click the **refresh** button in the Virtual Devices panel
 
@@ -191,7 +215,7 @@ The extension falls back to `adb shell screencap` which captures screenshots at 
 - Run **Caspian: Check Emulator Acceleration** to confirm WHPX, HAXM, or KVM is available. Without it the emulator runs in software mode and can take minutes or fail outright. On Windows 11, enable **Windows Hypervisor Platform** and **Virtual Machine Platform** in Windows Features, then reboot
 - Run **Caspian: Check Device Configuration**. Two RAM faults show up here: a virtual device created before v1.1.0 may have only 96 MB, which cannot boot Android at all; and an API 33+ Google APIs image on the emulator's 1536 MB default will boot and then swap, ANR, and show "System UI isn't responding". Both are fixed in `config.ini`, so wiping data will not help
 - Close memory-heavy processes. Caspian warns before launching when free RAM is short, warns again if memory runs out *while* the emulator is running, and can stop Gradle daemons for you either way
-- Try adding `-gpu swiftshader_indirect` to `caspian.emulatorArgs`
+- Set `caspian.emulator.gpuMode` to `swiftshader`. A host with a broken OpenGL driver can fail with a Qt error (`UpdateLayeredWindowIndirect failed`) that looks like a hang; Caspian now recognises that as a graphics failure and retries in software automatically
 
 **The emulator won't stop**
 - **Caspian: Stop Emulator** now confirms the emulator actually went, rather than assuming `adb emu kill` worked

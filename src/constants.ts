@@ -84,6 +84,9 @@ export const CONFIG = {
   WATCH_HOST_MEMORY: 'emulator.watchHostMemory',
   LOW_MEMORY_FLOOR_MB: 'emulator.lowMemoryFloorMb',
   CHECK_GUEST_RAM: 'avd.checkGuestRam',
+  EMULATOR_GPU_MODE: 'emulator.gpuMode',
+  EMULATOR_GPU_FALLBACK: 'emulator.gpuFallback',
+  PREFER_INSTALLED_IMAGE: 'avd.preferInstalledSystemImage',
   // Capture
   CAPTURE_DIRECTORY: 'captureDirectory',
   CAPTURE_OPEN_AFTER: 'capture.openAfterCapture',
@@ -131,6 +134,15 @@ export const SDK_DOWNLOAD = {
   MIN_DISK_SPACE: 5 * 1024 * 1024 * 1024,
   DEFAULT_AVD_NAME: 'Caspian_Default',
   DEFAULT_DEVICE_PROFILE: 'pixel_6',
+  /**
+   * Floor for the first-run system image, used only when `sdkmanager --list`
+   * cannot be read.
+   *
+   * The setup wizard normally installs the newest stable Google APIs image the
+   * SDK offers, so this number is a safety net rather than the usual outcome —
+   * which is the point, because a pinned API level goes stale every year.
+   */
+  FALLBACK_API_LEVEL: 36,
   PLATFORM_KEY: {
     win32: 'win',
     darwin: 'mac',
@@ -172,8 +184,8 @@ export interface DevicePreset {
  * *does* have the profile, its values win — see AvdManager.createAvd.
  */
 export const DEVICE_PRESETS: DevicePreset[] = [
-  { name: 'Pixel 9 Pro',  profile: 'pixel_9_pro',          api: 35, tag: 'google_apis', width: 1280, height: 2856, density: 480, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
-  { name: 'Pixel 9',      profile: 'pixel_9',              api: 35, tag: 'google_apis', width: 1080, height: 2424, density: 420, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 9 Pro',  profile: 'pixel_9_pro',          api: 36, tag: 'google_apis', width: 1280, height: 2856, density: 480, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 9',      profile: 'pixel_9',              api: 36, tag: 'google_apis', width: 1080, height: 2424, density: 420, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
   { name: 'Pixel 8 Pro',  profile: 'pixel_8_pro',          api: 34, tag: 'google_apis', width: 1344, height: 2992, density: 480, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
   { name: 'Pixel 8',      profile: 'pixel_8',              api: 34, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
   { name: 'Pixel 7 Pro',  profile: 'pixel_7_pro',          api: 33, tag: 'google_apis', width: 1440, height: 3120, density: 560, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
@@ -186,8 +198,8 @@ export const DEVICE_PRESETS: DevicePreset[] = [
   { name: 'Pixel Tablet', profile: 'pixel_tablet',         api: 34, tag: 'google_apis', width: 2560, height: 1600, density: 320, ram: 2048, heap: 512, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Google' },
   { name: 'Pixel 4 XL',   profile: 'pixel_4_xl',           api: 30, tag: 'google_apis', width: 1440, height: 3040, density: 560, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
   { name: 'Nexus 5X',     profile: 'Nexus 5X',             api: 28, tag: 'google_apis', width: 1080, height: 1920, density: 420, ram: 1536, heap: 192, orientation: 'portrait',  dataPartition: '2G', manufacturer: 'Google' },
-  { name: '7" Tablet',    profile: '7in WSVGA (Tablet)',   api: 35, tag: 'google_apis', width: 1024, height:  600, density: 160, ram: 2048, heap: 256, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Generic' },
-  { name: '10" Tablet',   profile: '10.1in WXGA (Tablet)', api: 35, tag: 'google_apis', width: 1280, height:  800, density: 160, ram: 2048, heap: 256, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Generic' },
+  { name: '7" Tablet',    profile: '7in WSVGA (Tablet)',   api: 36, tag: 'google_apis', width: 1024, height:  600, density: 160, ram: 2048, heap: 256, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Generic' },
+  { name: '10" Tablet',   profile: '10.1in WXGA (Tablet)', api: 36, tag: 'google_apis', width: 1280, height:  800, density: 160, ram: 2048, heap: 256, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Generic' },
 ];
 
 /** Look up a preset by its avdmanager device-profile id. */
@@ -245,6 +257,19 @@ export const DISPLAY_RULES = {
   AOSP_FALLBACK_HEIGHT: 640,
   AOSP_FALLBACK_DENSITY: 160,
   AOSP_FALLBACK_RAM_MB: 96,
+  /**
+   * Deflated bytes per pixel below which a capture is suspected of carrying no
+   * image — a screenshot from an emulator that is not rendering.
+   *
+   * Measured on the frame that prompted this check: 12,504 bytes for 1080x1920
+   * black is 0.0060 B/px, against 0.384 B/px for the same screen rendering. The
+   * threshold sits ~8x above the former and ~7.7x below the latter.
+   *
+   * Deliberately a ratio, not a flat byte count: the previous flat 10 KB floor
+   * came to 0.0049 B/px at that resolution — under the black frame it existed
+   * to catch — and scaled the wrong way across display sizes.
+   */
+  MIN_BYTES_PER_PIXEL: 0.05,
 } as const;
 
 /** Emulator launch pre-flight thresholds. */
@@ -259,6 +284,25 @@ export const LAUNCH_PREFLIGHT = {
   PROCESS_QUERY_TIMEOUT_MS: 2500,
   ACCEL_CHECK_TIMEOUT_MS: 8000,
 } as const;
+
+/**
+ * GPU rendering modes passed to the emulator as `-gpu <mode>`.
+ *
+ * 'auto' means "add no -gpu flag at all" and let the emulator decide, which is
+ * the behaviour every version before this one had.
+ */
+export const GPU_MODES = ['auto', 'host', 'swiftshader', 'swiftshader_indirect', 'angle_indirect'] as const;
+export type GpuMode = typeof GPU_MODES[number];
+
+/**
+ * The order tried when a launch fails and fallback is enabled.
+ *
+ * Ends at plain 'swiftshader' because that is the mode with no dependency on
+ * the host's graphics stack at all — the last thing that can still work on a
+ * machine whose GL is broken. 'swiftshader_indirect' sits in front of it
+ * because it is faster when it works, and it often does.
+ */
+export const GPU_FALLBACK_LADDER: GpuMode[] = ['auto', 'swiftshader_indirect', 'swiftshader'];
 
 /**
  * Guest RAM floors — how much memory Android itself needs inside the VM.

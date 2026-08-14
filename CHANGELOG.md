@@ -2,6 +2,31 @@
 
 All notable changes to Caspian Emulator will be documented in this file.
 
+## [1.3.0] - 2026-08-14
+
+### Added
+- **Blank captures are detected instead of shipped** — an emulator that boots, runs your app, and answers `screencap` with an entirely black frame used to pass every check: the PNG has the right dimensions, the right aspect ratio, and the right format, so it validated clean and went to the Play Console. Caspian now measures the image itself. A frame carrying too little data for its size is decoded and sampled, and a single flat colour is a hard validation failure naming the fix. This covers **Take Screenshot**, **Capture Store Screenshots**, and every cell of a matrix run — where one blank frame was otherwise multiplied across every locale, font scale, and density
+- **`caspian.emulator.gpuMode`** — the `-gpu` flag is now a setting (`auto`, `host`, `swiftshader`, `swiftshader_indirect`, `angle_indirect`) rather than something to hand-type into `caspian.emulatorArgs`. Previously Caspian passed no `-gpu` at all and had no opinion about rendering, while owning the screenshot feature that depends on it
+- **Automatic software-rendering fallback** — when the mode is `auto` and a launch dies with a graphics error, Caspian retries down a ladder (`auto` → `swiftshader_indirect` → `swiftshader`), once per device per session, then names the mode that worked and offers to save it. Disable with `caspian.emulator.gpuFallback`. An explicit `-gpu` in `caspian.emulatorArgs`, or any non-`auto` setting, is treated as a stated preference and never overridden
+- **Graphics failures are recognised** — a host with a broken OpenGL driver fails with a Qt error (`UpdateLayeredWindowIndirect failed — A device attached to the system is not functioning`) that carried no `PANIC:` or `ERROR:` prefix, so it matched none of the fatal-log patterns and presented as a 180-second hang with no diagnosis. It is now classified, reported, and used to trigger the fallback
+- **"Stop Build Daemons" can stop the daemon that is actually holding the memory** — a follow-up action terminates whatever survived, by pid
+- **`caspian.avd.preferInstalledSystemImage`** — device presets now treat their API level as a floor rather than an exact match, so creating a Pixel 9 Pro uses the newest system image you already have instead of downloading an older one
+
+### Fixed
+- **The low-memory remedy reported nothing when it achieved nothing.** `gradlew --stop` cannot stop the Kotlin compile daemon — which is routinely the larger of the two, holding around a gigabyte — yet the preflight named it as the culprit and then offered a remedy that could not clear it. All three sites re-measured afterwards but only spoke when memory had been freed, so the common case was silence, which reads as success. Caspian now says plainly when nothing was freed, names what is still resident, and offers to stop it
+- **The severe low-memory warning never offered the remedy for a Kotlin daemon.** The "memory is tight" tier checked for both daemon kinds; the "not enough memory" tier checked for Gradle only, so the more serious warning was the one missing the button
+- **Only one process per group could ever be stopped** — top-consumer rows are aggregated by name, and a build routinely leaves two or three daemons resident, but only the first pid was kept. Every pid in a group is now tracked
+- **The blank-frame guard used a flat 10 KB floor**, which at 1080×1920 works out to 0.0049 bytes per pixel — *below* a real all-black frame at 0.0060 — so it never fired on the thing it was written for. It is now a ratio, and a frame that is still empty after the retry is reported rather than returned silently
+- **Screenshot mode did not survive an emulator restart** — demo-mode state is keyed by serial, and a restarted emulator reclaims the same serial with a fresh SystemUI. The status bar went on saying screenshot mode was on while the device quietly showed a real clock, so the first capture after a restart carried wall-clock time. It is now re-applied when a device reconnects
+- **Take Screenshot never validated anything** — it used a separate three-round-trip path (device-side `screencap`, `pull`, `rm`) that never held the image bytes. It now uses the single-round-trip buffer path, needs no device-side temp file, and checks the frame before reporting success
+
+### Changed
+- **The setup wizard installs the newest stable Google APIs image the SDK offers** rather than a pinned Android 15, resolving it once so the image downloaded and the image the default AVD is created against cannot diverge. API 35 remains the offline fallback
+- **Pixel 9, Pixel 9 Pro, and both tablet presets default to API 36 (Android 16)**. Older Pixel presets stay pinned to their real launch API
+- **A stalled boot now names a GPU mode this host cannot drive** as a third possible cause, alongside too little guest RAM and a corrupt snapshot
+- **"Stop Gradle Daemons" is now "Stop Build Daemons"**, because it stops the Kotlin compile daemon too
+
+
 ## [1.2.0] - 2026-08-11
 
 ### Added

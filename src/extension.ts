@@ -12,6 +12,8 @@ import {
   CUTOUT_MODES,
   NAVBAR_MODES,
   OVERLAY_MIN_API,
+  GPU_FALLBACK_LADDER,
+  GpuMode,
   getDefaultAbi,
 } from './constants';
 import { SdkManager } from './sdk/SdkManager';
@@ -33,7 +35,8 @@ import { DemoModeController } from './capture/DemoMode';
 import { SystemUiOverlayController, OverlayCategory } from './capture/SystemUiOverlay';
 import { DeviceStateManager, DeviceStateSnapshot } from './capture/DeviceState';
 import { CaptureService, RunManifest, writeRunReport } from './capture/CaptureService';
-import { CaptureCancelledError, Orientation } from './capture/Orientation';
+import { CaptureCancelledError, Orientation, pngSize } from './capture/Orientation';
+import { FrameContentCheck, checkFrameContent } from './capture/FrameContent';
 import { resolveCaptureRoot, resolveRunDirectory, suggestRunName } from './capture/CapturePaths';
 import {
   FONT_SCALE_STOPS,
@@ -49,7 +52,7 @@ import { FileExplorerProvider, FileTreeItem } from './views/FileExplorerProvider
 import { LogcatPanel } from './views/LogcatPanel';
 import { EmulatorScreenPanel } from './views/EmulatorScreenPanel';
 import { QrPairingPanel } from './views/QrPairingPanel';
-import { SdkInfo, DeviceInfo, DeviceProfile, AvdHardware } from './types';
+import { SdkInfo, DeviceInfo, DeviceProfile, AvdHardware, SystemImage } from './types';
 import { Logger } from './utils/Logger';
 
 let sdkManager: SdkManager;
@@ -196,6 +199,8 @@ async function initializeWithSdk(context: vscode.ExtensionContext, sdk: SdkInfo)
       checkPendingRestores(context).catch(err => Logger.warn(`Pending-restore check failed: ${err}`));
       checkLeftoverOverrides(context, device.serial)
         .catch(err => Logger.warn(`Leftover-override check failed: ${err}`));
+      reapplyDemoModeIfStale(device.serial)
+        .catch(err => Logger.warn(`Screenshot-mode re-apply failed: ${err}`));
     }
   });
 
@@ -295,11 +300,20 @@ function registerCommands(context: vscode.ExtensionContext): void {
       });
       if (!name) { return; }
 
-      const systemImage = `system-images;android-${preset.api};${preset.tag};${abi}`;
+      const exactImage = `system-images;android-${preset.api};${preset.tag};${abi}`;
       const images = await avdManager.listSystemImages();
-      const alreadyInstalled = images.some(img => img.path === systemImage && img.installed);
+      // preset.api is a floor, not an exact match. An installed newer image is
+      // strictly better than downloading a gigabyte to get an older one, and it
+      // is the only way a preset keeps pace with Android releases.
+      const preferInstalled = vscode.workspace.getConfiguration(CONFIG.SECTION)
+        .get<boolean>(CONFIG.PREFER_INSTALLED_IMAGE, true);
+      let systemImage = (preferInstalled
+        ? pickInstalledSystemImage(images, preset.api, preset.tag, abi)
+        : undefined) ?? exactImage;
 
-      if (!alreadyInstalled) {
+      if (systemImage !== exactImage) {
+        Logger.info(`Using installed ${systemImage} for ${preset.name} rather than downloading API ${preset.api}.`);
+      } else if (!images.some(img => img.path === exactImage && img.installed)) {
         const choice = await vscode.window.showWarningMessage(
           `System image for ${preset.name} (Android ${preset.api}) is not installed. Download it now? (~1 GB)`,
           'Download', 'Cancel'
@@ -308,8 +322,9 @@ function registerCommands(context: vscode.ExtensionContext): void {
 
         await vscode.window.withProgress(
           { location: vscode.ProgressLocation.Notification, title: `Downloading ${preset.name} system image...`, cancellable: false },
-          async () => { await avdManager.installSystemImage(systemImage); }
+          async () => { await avdManager.installSystemImage(exactImage); }
         );
+        systemImage = exactImage;
       }
 
       // Tri-state: null means enumeration failed, which is NOT the same as
@@ -601,12 +616,43 @@ function registerCommands(context: vscode.ExtensionContext): void {
     });
     if (!uri) { return; }
 
-    await vscode.window.withProgress(
+    // Buffer path rather than screenshot(): it is one adb round trip instead of
+    // three, needs no device-side temp file, and hands back the bytes so the
+    // frame can be checked before the user is told it saved fine.
+    const buf = await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: 'Taking screenshot...' },
       async () => {
-        await adbClient.screenshot(serial, uri.fsPath);
+        const data = await adbClient.captureScreenshotBuffer(serial);
+        fs.writeFileSync(uri.fsPath, data);
+        return data;
       }
     );
+
+    let content: FrameContentCheck | undefined;
+    try {
+      const { width, height } = pngSize(buf);
+      content = checkFrameContent(buf, width, height);
+    } catch (err) {
+      Logger.debug(`Could not measure the screenshot: ${err}`);
+    }
+
+    if (content?.blank) {
+      const choice = await vscode.window.showWarningMessage(
+        `Screenshot saved, but ${content.reason}.`,
+        'Set GPU Mode',
+        'Show Folder',
+      );
+      if (choice === 'Set GPU Mode') {
+        await vscode.commands.executeCommand(
+          'workbench.action.openSettings',
+          `${CONFIG.SECTION}.${CONFIG.EMULATOR_GPU_MODE}`,
+        );
+      } else if (choice === 'Show Folder') {
+        await vscode.commands.executeCommand('revealFileInOS', uri);
+      }
+      return;
+    }
+
     vscode.window.showInformationMessage(`Screenshot saved to ${uri.fsPath}`);
   });
 
@@ -1331,6 +1377,25 @@ async function checkLeftoverOverrides(context: vscode.ExtensionContext, serial: 
   }
 }
 
+/**
+ * Put screenshot mode back after a device comes back.
+ *
+ * Demo-mode state lives in a process-global map keyed by serial, but the state
+ * it describes lives in SystemUI. A restarted emulator reclaims the same serial
+ * (emulator-5554) with a fresh SystemUI, so the map goes on saying screenshot
+ * mode is on — the status bar item stays lit — while the device quietly shows a
+ * real clock again. The first capture after a restart then carries wall-clock
+ * time, which is exactly what screenshot mode exists to prevent.
+ *
+ * reapply() is exit-then-enter, so its leading `command exit` is a harmless
+ * no-op on a device that is not actually in demo mode.
+ */
+async function reapplyDemoModeIfStale(serial: string): Promise<void> {
+  if (!DemoModeController.isActive(serial)) { return; }
+  if (captureInFlight.has(serial)) { return; }
+  await new DemoModeController(adbClient).reapply(serial);
+}
+
 function autoSelectFileExplorerDevice(devices: DeviceInfo[]): void {
   if (!fileExplorerProvider) { return; }
 
@@ -1370,11 +1435,38 @@ function updateStatusBar(devices: DeviceInfo[]): void {
   }
 }
 
+/**
+ * The best installed system image for a preset, or undefined if none qualifies.
+ *
+ * "Best" is the highest API at or above the preset's own, same tag and ABI. A
+ * preset pins an API because that is what the device shipped with, but a newer
+ * image on the same hardware profile is what a developer actually wants to test
+ * against — and it is already on disk.
+ */
+function pickInstalledSystemImage(
+  images: SystemImage[],
+  minApi: number,
+  tag: string,
+  abi: string,
+): string | undefined {
+  return images
+    .filter(img => img.installed && img.tag === tag && img.abi === abi && img.apiLevel >= minApi)
+    .sort((a, b) => b.apiLevel - a.apiLevel)[0]?.path;
+}
+
 // ── Launch ──
 
 /**
  * Shared launch path for LAUNCH_AVD and COLD_BOOT_AVD, so the two cannot drift.
  */
+type LaunchOutcome =
+  | { kind: 'ready' }
+  | { kind: 'cancelled' }
+  | { kind: 'failed'; detail: string; graphics: boolean };
+
+/** AVDs already taken down the GPU ladder once, so a bad host retries only once. */
+const gpuLaddered = new Set<string>();
+
 async function launchAvdWithPreflight(
   avdName: string,
   opts: { coldBoot: boolean; wipeData?: boolean },
@@ -1382,36 +1474,126 @@ async function launchAvdWithPreflight(
   const cfg = vscode.workspace.getConfiguration(CONFIG.SECTION);
   // Spread: getConfiguration().get() returns shared (frozen) config state, and
   // the previous code pushed straight into it.
-  const extraArgs = [...cfg.get<string[]>(CONFIG.EMULATOR_ARGS, [])];
+  const baseArgs = [...cfg.get<string[]>(CONFIG.EMULATOR_ARGS, [])];
 
   // A force-killed emulator left an unflushed snapshot behind; loading it is
   // exactly the hang we are trying to avoid, so escalate to a cold boot.
   const coldBoot = opts.coldBoot || opts.wipeData
     || cfg.get<boolean>(CONFIG.COLD_BOOT, false)
     || snapshotSuspect.has(avdName);
-  if (coldBoot && !extraArgs.includes('-no-snapshot-load')) {
-    extraArgs.push('-no-snapshot-load');
+  if (coldBoot && !baseArgs.includes('-no-snapshot-load')) {
+    baseArgs.push('-no-snapshot-load');
   }
-  if (opts.wipeData && !extraArgs.includes('-wipe-data')) {
-    extraArgs.push('-wipe-data');
+  if (opts.wipeData && !baseArgs.includes('-wipe-data')) {
+    baseArgs.push('-wipe-data');
   }
 
   if (!(await runLaunchPreflight(avdManager, avdName))) { return; }
 
   const captureLog = cfg.get<boolean>(CONFIG.CAPTURE_LOG, true);
-  const proc = avdManager.launchEmulator(avdName, extraArgs, captureLog);
-  snapshotSuspect.delete(avdName);
-
   const timeoutSec = cfg.get<number>(CONFIG.BOOT_TIMEOUT_SEC, BOOT_WATCH.DEFAULT_TIMEOUT_SEC);
 
-  vscode.window.withProgress(
+  // An explicit -gpu in emulatorArgs outranks the setting, and both outrank the
+  // ladder: a stated preference is not a guess to be second-guessed.
+  const userChoseGpu = baseArgs.includes('-gpu');
+  const configured = cfg.get<GpuMode>(CONFIG.EMULATOR_GPU_MODE, 'auto');
+  const canLadder = cfg.get<boolean>(CONFIG.EMULATOR_GPU_FALLBACK, true)
+    && !userChoseGpu
+    && configured === 'auto'
+    && !gpuLaddered.has(avdName);
+
+  const modes: GpuMode[] = canLadder
+    ? GPU_FALLBACK_LADDER
+    : [userChoseGpu ? 'auto' : configured];
+
+  for (let i = 0; i < modes.length; i++) {
+    const mode = modes[i];
+    const args = [...baseArgs];
+    // 'auto' means add no flag at all and let the emulator choose, which is
+    // what every version before this one did.
+    if (mode !== 'auto') { args.push('-gpu', mode); }
+
+    const outcome = await watchLaunch(avdName, args, { captureLog, timeoutSec, mode, attempt: i });
+
+    if (outcome.kind === 'cancelled') { return; }
+    if (outcome.kind === 'ready') {
+      if (i > 0) { offerToKeepGpuMode(avdName, mode); }
+      return;
+    }
+
+    // Only a graphics failure is worth another mode. Retrying a missing system
+    // image with a different renderer just costs the user another timeout.
+    const next = modes[i + 1];
+    if (!next || !outcome.graphics) {
+      reportLaunchProblem(avdName, outcome.detail);
+      return;
+    }
+
+    gpuLaddered.add(avdName);
+    Logger.warn(
+      `${avdName} failed to start with GPU mode "${mode}" (${outcome.detail}); retrying with "${next}".`,
+    );
+    await forceStopForRetry(avdName);
+  }
+}
+
+/** Tell the user which mode rescued the launch, and offer to make it stick. */
+function offerToKeepGpuMode(avdName: string, mode: GpuMode): void {
+  Logger.info(`${avdName} started with -gpu ${mode} after the previous mode failed.`);
+  vscode.window.showInformationMessage(
+    `${avdName} started with GPU mode "${mode}" after the default failed.`,
+    'Use This Mode',
+    'Show Log',
+  ).then(choice => {
+    if (choice === 'Use This Mode') {
+      vscode.workspace.getConfiguration(CONFIG.SECTION)
+        .update(CONFIG.EMULATOR_GPU_MODE, mode, vscode.ConfigurationTarget.Global);
+    } else if (choice === 'Show Log') {
+      vscode.commands.executeCommand(COMMANDS.SHOW_EMULATOR_LOG, { avd: { name: avdName } });
+    }
+  });
+}
+
+/**
+ * Make sure a failed emulator is gone before the next rung is tried.
+ *
+ * Best-effort: a process that already died leaves nothing to kill, and a
+ * failure here must not stop the retry that is the whole point.
+ */
+async function forceStopForRetry(avdName: string): Promise<void> {
+  try {
+    await avdManager.forceKillEmulator(avdName);
+  } catch (err) {
+    Logger.debug(`Nothing to clean up before retrying ${avdName}: ${err}`);
+  }
+  avdTreeProvider.refresh();
+}
+
+/**
+ * Launch once and watch the boot through to a verdict.
+ *
+ * Reports progress but never reports *failure* — the caller owns that, because
+ * only the caller knows whether another GPU mode is about to be tried.
+ */
+function watchLaunch(
+  avdName: string,
+  args: string[],
+  opts: { captureLog: boolean; timeoutSec: number; mode: GpuMode; attempt: number },
+): Thenable<LaunchOutcome> {
+  const { captureLog, timeoutSec, mode, attempt } = opts;
+  const proc = avdManager.launchEmulator(avdName, args, captureLog);
+  snapshotSuspect.delete(avdName);
+
+  const suffix = attempt > 0 ? ` (GPU mode "${mode}")` : '';
+
+  return vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
-      title: `Starting ${avdName}`,
+      title: `Starting ${avdName}${suffix}`,
       // Cancelling stops the watch, not the emulator — the message says so.
       cancellable: true,
     },
-    async (progress, token) => {
+    async (progress, token): Promise<LaunchOutcome> => {
       const started = Date.now();
       const deadline = started + timeoutSec * 1000;
       let serial: string | undefined;
@@ -1424,20 +1606,28 @@ async function launchAvdWithPreflight(
         if (token.isCancellationRequested) {
           Logger.info(`Stopped watching the boot of ${avdName}; the emulator is still starting.`);
           avdTreeProvider.refresh();
-          return;
+          return { kind: 'cancelled' };
         }
         await new Promise(r => setTimeout(r, BOOT_WATCH.POLL_MS));
 
         const failure = captureLog ? avdManager.readLaunchFailure(avdName) : undefined;
         if (failure) {
           avdTreeProvider.refresh();
-          reportLaunchProblem(avdName, `Emulator failed to start: ${failure}`);
-          return;
+          return {
+            kind: 'failed',
+            detail: `Emulator failed to start: ${failure}`,
+            graphics: AvdManager.isGraphicsFailure(failure),
+          };
         }
         if (proc.process && proc.process.exitCode !== null && proc.process.exitCode !== 0) {
           avdTreeProvider.refresh();
-          reportLaunchProblem(avdName, `Emulator exited immediately (code ${proc.process.exitCode}).`);
-          return;
+          // An immediate exit with nothing in the log is the shape a graphics
+          // failure takes when the emulator dies before it can write one.
+          return {
+            kind: 'failed',
+            detail: `Emulator exited immediately (code ${proc.process.exitCode}).`,
+            graphics: true,
+          };
         }
 
         // Resolve the serial once, then probe the guest itself. `adb devices`
@@ -1465,7 +1655,7 @@ async function launchAvdWithPreflight(
         if (phase === 'ready') {
           Logger.info(`${avdName} finished booting in ${Math.round((Date.now() - started) / 1000)}s.`);
           avdTreeProvider.refresh();
-          return;
+          return { kind: 'ready' };
         }
 
         // Require the verdict twice running before giving up on a boot: a
@@ -1473,23 +1663,24 @@ async function launchAvdWithPreflight(
         wedgedStreak = next === 'wedged' ? wedgedStreak + 1 : 0;
         if (wedgedStreak >= 2) {
           avdTreeProvider.refresh();
-          reportLaunchProblem(
-            avdName,
-            `${avdName} started but Android never finished booting`
-            + `${signals.pmError ? ` — the package manager reports "${signals.pmError.split('\n')[0].trim()}"` : ''}. `
-            + 'This is usually too little guest RAM or a corrupt snapshot.',
-          );
-          return;
+          return {
+            kind: 'failed',
+            graphics: false,
+            detail: `${avdName} started but Android never finished booting`
+              + `${signals.pmError ? ` — the package manager reports "${signals.pmError.split('\n')[0].trim()}"` : ''}. `
+              + 'This is usually too little guest RAM, a corrupt snapshot, or a GPU mode this host cannot drive.',
+          };
         }
       }
 
       avdTreeProvider.refresh();
       // Previously this fell through silently, making a slow boot and a hang
       // look identical. Say which one it was.
-      reportLaunchProblem(
-        avdName,
-        `${avdName} has not finished booting after ${timeoutSec}s (${describeBootPhase(phase).toLowerCase()}).`,
-      );
+      return {
+        kind: 'failed',
+        graphics: false,
+        detail: `${avdName} has not finished booting after ${timeoutSec}s (${describeBootPhase(phase).toLowerCase()}).`,
+      };
     }
   );
 }

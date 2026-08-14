@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { CONFIG } from '../constants';
 import { formatMb, getHostMemory, getTopMemoryConsumers } from '../utils/HostResources';
-import { findGradleWrapper, stopGradleDaemons } from './LaunchPreflight';
+import { findGradleWrapper, runDaemonRemedy } from './LaunchPreflight';
 import { Logger } from '../utils/Logger';
 
 /**
@@ -95,33 +95,21 @@ export class MemoryWatcher implements vscode.Disposable {
     );
 
     const daemon = procs.find(p => p.label === 'Gradle daemon' || p.label === 'Kotlin compile daemon');
+    // Offered whenever a daemon is resident: with no wrapper the remedy goes
+    // straight to terminating by pid, which is what clears a Kotlin daemon.
     const wrapper = daemon ? findGradleWrapper() : undefined;
 
     const choice = await vscode.window.showWarningMessage(
       `Only ${formatMb(availableMb)} of memory is free while an emulator is running`
       + `${daemon ? ` — ${daemon.name} is using ${formatMb(daemon.mb)}` : ''}. `
       + 'The emulator may stop responding.',
-      ...(wrapper ? ['Stop Gradle Daemons'] : []),
+      ...(daemon ? ['Stop Build Daemons'] : []),
       'Show Details',
       "Don't Warn Again",
     );
 
-    if (choice === 'Stop Gradle Daemons' && wrapper) {
-      try {
-        await vscode.window.withProgress(
-          { location: vscode.ProgressLocation.Notification, title: 'Stopping Gradle daemons...', cancellable: false },
-          () => stopGradleDaemons(wrapper),
-        );
-        const after = await getHostMemory();
-        const freed = after.availableMb - availableMb;
-        if (freed > 0) {
-          vscode.window.showInformationMessage(
-            `Freed ${formatMb(freed)}. Now ${formatMb(after.availableMb)} available.`,
-          );
-        }
-      } catch (err) {
-        vscode.window.showWarningMessage(`Could not stop Gradle daemons: ${err}`);
-      }
+    if (choice === 'Stop Build Daemons') {
+      await runDaemonRemedy(wrapper, availableMb);
     } else if (choice === 'Show Details') {
       Logger.show();
     } else if (choice === "Don't Warn Again") {

@@ -16,7 +16,14 @@ export interface HostMemory {
 
 export interface HostProcess {
   name: string;
-  pid: number;
+  /**
+   * Every pid in the group, not just the first.
+   *
+   * Rows are aggregated by name, and a build routinely leaves two or three
+   * daemons resident — a remedy that killed only `pids[0]` would report
+   * success while most of the memory stayed held.
+   */
+  pids: number[];
   mb: number;
   /** How many processes with this name were aggregated. */
   count: number;
@@ -154,10 +161,11 @@ export async function getTopMemoryConsumers(
     if (existing) {
       existing.mb += row.bytes / 1048576;
       existing.count += 1;
+      if (row.pid) { existing.pids.push(row.pid); }
     } else {
       grouped.set(key, {
         name: row.name,
-        pid: row.pid,
+        pids: row.pid ? [row.pid] : [],
         mb: row.bytes / 1048576,
         count: 1,
         label: TAG_LABELS[row.tag],
@@ -169,6 +177,45 @@ export async function getTopMemoryConsumers(
     .map(p => ({ ...p, mb: Math.round(p.mb) }))
     .sort((a, b) => b.mb - a.mb)
     .slice(0, limit);
+}
+
+/** Labels this module is willing to terminate. Never an arbitrary process. */
+const KILLABLE_LABELS = new Set(['Gradle daemon', 'Kotlin compile daemon']);
+
+/** Build daemons still resident, i.e. what `gradlew --stop` failed to clear. */
+export function residentBuildDaemons(procs: HostProcess[]): HostProcess[] {
+  return procs.filter(p => p.label && KILLABLE_LABELS.has(p.label) && p.pids.length > 0);
+}
+
+/**
+ * Terminate the enumerated build daemons by pid.
+ *
+ * `gradlew --stop` speaks to the Gradle daemon registry, which the Kotlin
+ * compile daemon is not in — it routinely survives with a gigabyte held, and
+ * there is no wrapper command that stops it. Killing it is safe: it is a
+ * disposable cache that the next build restarts.
+ *
+ * Restricted to labelled entries by `residentBuildDaemons`, so a bad label
+ * match can never take out an unrelated process. Returns how many died.
+ */
+export function killBuildDaemons(procs: HostProcess[]): { killed: number; failed: number } {
+  let killed = 0;
+  let failed = 0;
+  for (const proc of residentBuildDaemons(procs)) {
+    for (const pid of proc.pids) {
+      try {
+        process.kill(pid);
+        killed++;
+      } catch (err) {
+        // ESRCH means it already exited, which is the outcome we wanted.
+        if ((err as NodeJS.ErrnoException).code === 'ESRCH') { killed++; } else {
+          failed++;
+          Logger.warn(`Could not stop ${proc.name} (pid ${pid}): ${err}`);
+        }
+      }
+    }
+  }
+  return { killed, failed };
 }
 
 /** Format bytes-as-MB for user-facing text. */

@@ -2,7 +2,7 @@
   "name": "caspian-emulator",
   "displayName": "Caspian Emulator",
   "description": "Android emulator management for VS Code — no Android Studio required. AVD control, store screenshot capture, locale and accessibility sweeps, embedded screen, ADB tools, logcat viewer, and automatic SDK setup.",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "publisher": "CaspianTools",
   "license": "MIT",
   "engines": {
@@ -159,6 +159,29 @@
           "type": "boolean",
           "default": true,
           "description": "Flag virtual devices configured with less RAM than their system image needs. Modern Google APIs images swap and stop responding below 2560 MB."
+        },
+        "caspian.emulator.gpuMode": {
+          "type": "string",
+          "enum": ["auto", "host", "swiftshader", "swiftshader_indirect", "angle_indirect"],
+          "enumDescriptions": [
+            "Let the emulator choose. No -gpu flag is passed.",
+            "Use the host GPU directly. Fastest when the host's OpenGL driver works.",
+            "Pure software rendering. Slowest, but works on any host and always produces a readable frame.",
+            "Software rendering with an indirect swap chain. Faster than swiftshader, but renders black on some hosts.",
+            "Direct3D via ANGLE. Windows only."
+          ],
+          "default": "auto",
+          "description": "GPU rendering mode passed to the emulator as -gpu. Use \"swiftshader\" if screenshots come out black. An explicit -gpu in caspian.emulatorArgs overrides this."
+        },
+        "caspian.emulator.gpuFallback": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a launch fails with a graphics error, retry automatically with software rendering. Only applies when caspian.emulator.gpuMode is \"auto\"."
+        },
+        "caspian.avd.preferInstalledSystemImage": {
+          "type": "boolean",
+          "default": true,
+          "description": "When creating a device from a preset, use the newest installed system image at or above the preset's API level instead of downloading the exact one."
         },
         "caspian.avd.playStoreStrictAspect": {
           "type": "boolean",
