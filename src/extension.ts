@@ -7,6 +7,10 @@ import {
   VIEWS,
   CONFIG,
   DEVICE_PRESETS,
+  DEVICE_GROUP_ORDER,
+  DEVICE_GROUP_LABELS,
+  DevicePreset,
+  avdNameForPreset,
   DISPLAY_RULES,
   BOOT_WATCH,
   CUTOUT_MODES,
@@ -272,7 +276,7 @@ function registerCommands(context: vscode.ExtensionContext): void {
   reg(COMMANDS.CREATE_AVD, async () => {
     const mode = await vscode.window.showQuickPick(
       [
-        { label: '$(device-mobile) From preset', description: 'Pixel 9, Pixel 8, Pixel Fold, Tablet...', value: 'preset' },
+        { label: '$(device-mobile) From preset', description: 'Pixel, Galaxy, OnePlus, Xiaomi, foldables, tablets...', value: 'preset' },
         { label: '$(settings-gear) Custom', description: 'Choose system image and device profile manually', value: 'custom' },
       ],
       { placeHolder: 'How do you want to create the virtual device?' }
@@ -282,17 +286,20 @@ function registerCommands(context: vscode.ExtensionContext): void {
     if (mode.value === 'preset') {
       const abi = getDefaultAbi();
       const presetPick = await vscode.window.showQuickPick(
-        DEVICE_PRESETS.map(p => ({
-          label: p.name,
-          description: `Android ${p.api}  •  ${abi}`,
-          preset: p,
-        })),
-        { placeHolder: 'Select a device' }
+        buildDevicePickItems(abi),
+        {
+          placeHolder: 'Select a device',
+          // The list is 37 rows across five groups; matching on label alone
+          // makes "samsung", "tablet" and "1440" all fail to narrow it.
+          matchOnDescription: true,
+          matchOnDetail: true,
+        }
       );
-      if (!presetPick) { return; }
+      // Separators are unselectable, but the item type has to allow them.
+      if (!presetPick?.preset) { return; }
 
       const preset = presetPick.preset;
-      const defaultName = `${preset.name.replace(/[\s]/g, '_')}_API${preset.api}`;
+      const defaultName = avdNameForPreset(preset);
       const name = await vscode.window.showInputBox({
         prompt: 'AVD name',
         value: defaultName,
@@ -327,21 +334,26 @@ function registerCommands(context: vscode.ExtensionContext): void {
         systemImage = exactImage;
       }
 
-      // Tri-state: null means enumeration failed, which is NOT the same as
-      // "this SDK has no such profile". Conflating them is what silently
-      // produced AVDs with no display configuration at all.
-      let profiles: DeviceProfile[] | null = null;
-      try {
-        profiles = await avdManager.listDeviceProfiles();
-      } catch (err) {
-        Logger.warn(`Could not list device profiles (${err}). Will attempt -d and fall back.`);
-      }
+      // Presets with no sdkProfile (every Samsung/OnePlus/Xiaomi) have no device
+      // definition to look for — skip the enumeration entirely and let the
+      // hardware below configure the AVD.
+      let deviceProfile: string | undefined = preset.sdkProfile;
+      if (preset.sdkProfile) {
+        // Tri-state: null means enumeration failed, which is NOT the same as
+        // "this SDK has no such profile". Conflating them is what silently
+        // produced AVDs with no display configuration at all.
+        let profiles: DeviceProfile[] | null = null;
+        try {
+          profiles = await avdManager.listDeviceProfiles();
+        } catch (err) {
+          Logger.warn(`Could not list device profiles (${err}). Will attempt -d and fall back.`);
+        }
 
-      let deviceProfile: string | undefined = preset.profile;
-      if (profiles !== null && !profiles.some(p => p.id === preset.profile)) {
-        // Known-missing: skip -d up front. No prompt — we supply the hardware.
-        Logger.info(`Device profile "${preset.profile}" is not in this SDK; applying hardware directly.`);
-        deviceProfile = undefined;
+        if (profiles !== null && !profiles.some(p => p.id === preset.sdkProfile)) {
+          // Known-missing: skip -d up front. No prompt — we supply the hardware.
+          Logger.info(`Device profile "${preset.sdkProfile}" is not in this SDK; applying hardware directly.`);
+          deviceProfile = undefined;
+        }
       }
 
       const hardware: AvdHardware = {
@@ -365,17 +377,24 @@ function registerCommands(context: vscode.ExtensionContext): void {
       const res = `${result.effective.width}×${result.effective.height} @ ${result.effective.density} dpi`;
       if (result.profileApplied) {
         vscode.window.showInformationMessage(`${preset.name} virtual device "${name}" created (${res}).`);
+      } else if (!preset.sdkProfile) {
+        // Nothing is missing here — no SDK has ever carried this device, so the
+        // preset's own hardware is the intended path, not a degraded one.
+        vscode.window.showInformationMessage(
+          `${preset.name} virtual device "${name}" created (${res}).`
+          + (preset.foldable ? ' Folding postures are not emulated for non-Google foldables.' : '')
+        );
       } else if (preset.foldable) {
         vscode.window.showWarningMessage(
           `${preset.name} virtual device "${name}" created with a ${res} display. `
-          + `Your SDK does not include the "${preset.profile}" device definition, so folding postures are not emulated. `
+          + `Your SDK does not include the "${preset.sdkProfile}" device definition, so folding postures are not emulated. `
           + 'Update the SDK command-line tools for full fold support.',
           'Update SDK Tools'
         ).then(c => { if (c === 'Update SDK Tools') { vscode.commands.executeCommand(COMMANDS.DOWNLOAD_SDK); } });
       } else {
         vscode.window.showInformationMessage(
           `${preset.name} virtual device "${name}" created (${res}). `
-          + `Your SDK lacks the "${preset.profile}" device definition, so Caspian configured the display directly.`
+          + `Your SDK lacks the "${preset.sdkProfile}" device definition, so Caspian configured the display directly.`
         );
       }
 
@@ -1435,6 +1454,32 @@ function updateStatusBar(devices: DeviceInfo[]): void {
   }
 }
 
+type PresetPickItem = vscode.QuickPickItem & { preset?: DevicePreset };
+
+/**
+ * The device picker, grouped under separator headers.
+ *
+ * A flat 37-row list is unusable, and QuickPick has no grouping of its own — the
+ * order of DEVICE_GROUP_ORDER is the order the sections appear in.
+ */
+function buildDevicePickItems(abi: string): PresetPickItem[] {
+  const items: PresetPickItem[] = [];
+  for (const group of DEVICE_GROUP_ORDER) {
+    const inGroup = DEVICE_PRESETS.filter(p => p.group === group);
+    if (inGroup.length === 0) { continue; }
+    items.push({ label: DEVICE_GROUP_LABELS[group], kind: vscode.QuickPickItemKind.Separator });
+    for (const p of inGroup) {
+      items.push({
+        label: p.name,
+        description: `${p.manufacturer}  •  Android ${p.api}+  •  ${abi}`,
+        detail: `${p.width}×${p.height} @ ${p.density} dpi${p.foldable ? '  •  unfolded' : ''}`,
+        preset: p,
+      });
+    }
+  }
+  return items;
+}
+
 /**
  * The best installed system image for a preset, or undefined if none qualifies.
  *
@@ -1828,15 +1873,33 @@ async function resolveAvdSerial(avdName: string): Promise<string | undefined> {
 /** Languages that are written right-to-left, for the matrix wizard. */
 const RTL_LANGUAGES = new Set(['ar', 'he', 'iw', 'fa', 'ur', 'ps', 'sd', 'yi', 'dv']);
 
-const COMMON_DISPLAY_SPECS = [
-  { label: '1080×2400 @ 420 dpi', width: 1080, height: 2400, density: 420, hint: 'Pixel 6/7/8' },
-  { label: '1080×1920 @ 420 dpi', width: 1080, height: 1920, density: 420, hint: 'Classic 16:9 phone' },
-  { label: '1440×3120 @ 560 dpi', width: 1440, height: 3120, density: 560, hint: 'Pixel 6 Pro/7 Pro' },
-  { label: '1280×2856 @ 480 dpi', width: 1280, height: 2856, density: 480, hint: 'Pixel 9 Pro' },
-  { label: '1440×3040 @ 560 dpi', width: 1440, height: 3040, density: 560, hint: 'Pixel 4 XL' },
-  { label: '2560×1600 @ 320 dpi', width: 2560, height: 1600, density: 320, hint: 'Pixel Tablet' },
-  { label: '1280×800 @ 160 dpi', width: 1280, height: 800, density: 160, hint: '10" tablet' },
-];
+/**
+ * Repair-menu resolutions, derived from DEVICE_PRESETS rather than restated.
+ *
+ * Several presets share a geometry (every 1080×2400 @ 420 phone, say), so the
+ * list is deduped and the sharing devices become the hint.
+ */
+const COMMON_DISPLAY_SPECS = (() => {
+  const byGeometry = new Map<string, { width: number; height: number; density: number; names: string[] }>();
+  for (const p of DEVICE_PRESETS) {
+    const key = `${p.width}x${p.height}@${p.density}`;
+    const hit = byGeometry.get(key);
+    if (hit) {
+      hit.names.push(p.name);
+    } else {
+      byGeometry.set(key, { width: p.width, height: p.height, density: p.density, names: [p.name] });
+    }
+  }
+  return [...byGeometry.values()].map(spec => ({
+    label: `${spec.width}×${spec.height} @ ${spec.density} dpi`,
+    width: spec.width,
+    height: spec.height,
+    density: spec.density,
+    hint: spec.names.length > 3
+      ? `${spec.names.slice(0, 3).join(', ')} +${spec.names.length - 3} more`
+      : spec.names.join(', '),
+  }));
+})();
 
 async function checkAvdDisplay(avdName: string): Promise<void> {
   const config = avdManager.readAvdConfig(avdName);

@@ -150,9 +150,34 @@ export const SDK_DOWNLOAD = {
   } as Record<string, string>,
 } as const;
 
+/** Picker grouping. Foldables and tablets group by form factor, phones by brand. */
+export type DeviceGroup = 'pixel' | 'samsung' | 'phone' | 'foldable' | 'tablet';
+
+/** Separator order in the device picker. */
+export const DEVICE_GROUP_ORDER: DeviceGroup[] = ['pixel', 'samsung', 'phone', 'foldable', 'tablet'];
+
+export const DEVICE_GROUP_LABELS: Record<DeviceGroup, string> = {
+  pixel: 'Google Pixel',
+  samsung: 'Samsung Galaxy',
+  phone: 'Other phones',
+  foldable: 'Foldables',
+  tablet: 'Tablets',
+};
+
 export interface DevicePreset {
   name: string;
+  /**
+   * Stable identity for this preset: written to hw.device.name and the key for
+   * findPresetByProfileId. NOT necessarily an id avdmanager knows — see sdkProfile.
+   */
   profile: string;
+  /**
+   * The avdmanager `-d` id, when a real SDK device definition exists. Absent for
+   * every non-Google device: no SDK has ever shipped a Samsung or Xiaomi profile,
+   * so creation skips `-d` up front and writes the hardware below directly.
+   */
+  sdkProfile?: string;
+  group: DeviceGroup;
   api: number;
   tag: string;
   /** Framebuffer width in px (hw.lcd.width), portrait-natural. */
@@ -177,30 +202,86 @@ export interface DevicePreset {
 /**
  * Curated list of popular Android devices for one-click AVD creation.
  *
- * The hardware fields are a *fallback* used when this SDK's cmdline-tools do
- * not carry the device definition (e.g. build 11076708 predates every Pixel 9
- * profile). Without them `avdmanager create avd` omits hw.lcd.* entirely and
- * the emulator falls back to 320x640 @ 160 dpi with 96 MB of RAM. When the SDK
- * *does* have the profile, its values win — see AvdManager.createAvd.
+ * For rows that carry an `sdkProfile`, the hardware fields are a *fallback* used
+ * when this SDK's cmdline-tools do not carry the device definition (e.g. build
+ * 11076708 predates every Pixel 9 profile). Without them `avdmanager create avd`
+ * omits hw.lcd.* entirely and the emulator falls back to 320x640 @ 160 dpi with
+ * 96 MB of RAM. When the SDK *does* have the profile, its values win — see
+ * AvdManager.createAvd.
+ *
+ * For rows with no `sdkProfile` — every Samsung, OnePlus and Xiaomi entry — no
+ * device definition exists anywhere, so these values *are* the device. Densities
+ * are picked so the resulting dp size matches the real hardware (dp = px*160/dpi),
+ * because dp is what layouts actually respond to: a Galaxy S25 Ultra is 1440 px
+ * wide at 600 dpi, i.e. 384dp, not the 411dp a Pixel-ish 560 dpi would give.
+ *
+ * `ram` must clear guestRamFloorMb() for the image that ends up being used, and
+ * `api` is only a floor — pickInstalledSystemImage happily pairs an old preset
+ * with the newest installed image — so every GMS row sits at 2560 MB or above
+ * regardless of its declared API level. Otherwise the AVD is born wearing the
+ * "low RAM" warning badge. Pair `heap` with heapForRamMb(ram).
  */
 export const DEVICE_PRESETS: DevicePreset[] = [
-  { name: 'Pixel 9 Pro',  profile: 'pixel_9_pro',          api: 36, tag: 'google_apis', width: 1280, height: 2856, density: 480, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
-  { name: 'Pixel 9',      profile: 'pixel_9',              api: 36, tag: 'google_apis', width: 1080, height: 2424, density: 420, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
-  { name: 'Pixel 8 Pro',  profile: 'pixel_8_pro',          api: 34, tag: 'google_apis', width: 1344, height: 2992, density: 480, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
-  { name: 'Pixel 8',      profile: 'pixel_8',              api: 34, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
-  { name: 'Pixel 7 Pro',  profile: 'pixel_7_pro',          api: 33, tag: 'google_apis', width: 1440, height: 3120, density: 560, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
-  { name: 'Pixel 7',      profile: 'pixel_7',              api: 33, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
-  { name: 'Pixel 7a',     profile: 'pixel_7a',             api: 33, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
-  { name: 'Pixel 6 Pro',  profile: 'pixel_6_pro',          api: 32, tag: 'google_apis', width: 1440, height: 3120, density: 560, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
-  { name: 'Pixel 6',      profile: 'pixel_6',              api: 32, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
-  { name: 'Pixel 6a',     profile: 'pixel_6a',             api: 32, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
-  { name: 'Pixel Fold',   profile: 'pixel_fold',           api: 34, tag: 'google_apis', width: 2208, height: 1840, density: 420, ram: 2048, heap: 512, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Google', foldable: true },
-  { name: 'Pixel Tablet', profile: 'pixel_tablet',         api: 34, tag: 'google_apis', width: 2560, height: 1600, density: 320, ram: 2048, heap: 512, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Google' },
-  { name: 'Pixel 4 XL',   profile: 'pixel_4_xl',           api: 30, tag: 'google_apis', width: 1440, height: 3040, density: 560, ram: 2048, heap: 256, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
-  { name: 'Nexus 5X',     profile: 'Nexus 5X',             api: 28, tag: 'google_apis', width: 1080, height: 1920, density: 420, ram: 1536, heap: 192, orientation: 'portrait',  dataPartition: '2G', manufacturer: 'Google' },
-  { name: '7" Tablet',    profile: '7in WSVGA (Tablet)',   api: 36, tag: 'google_apis', width: 1024, height:  600, density: 160, ram: 2048, heap: 256, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Generic' },
-  { name: '10" Tablet',   profile: '10.1in WXGA (Tablet)', api: 36, tag: 'google_apis', width: 1280, height:  800, density: 160, ram: 2048, heap: 256, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Generic' },
+  // ── Google Pixel ──────────────────────────────────────────────────────────
+  { name: 'Pixel 10 Pro XL', profile: 'pixel_10_pro_xl',      sdkProfile: 'pixel_10_pro_xl',      group: 'pixel',    api: 36, tag: 'google_apis', width: 1344, height: 2992, density: 480, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 10 Pro',    profile: 'pixel_10_pro',         sdkProfile: 'pixel_10_pro',         group: 'pixel',    api: 36, tag: 'google_apis', width: 1280, height: 2856, density: 480, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 10',        profile: 'pixel_10',             sdkProfile: 'pixel_10',             group: 'pixel',    api: 36, tag: 'google_apis', width: 1080, height: 2424, density: 420, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 9 Pro XL',  profile: 'pixel_9_pro_xl',       sdkProfile: 'pixel_9_pro_xl',       group: 'pixel',    api: 36, tag: 'google_apis', width: 1344, height: 2992, density: 480, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 9 Pro',     profile: 'pixel_9_pro',          sdkProfile: 'pixel_9_pro',          group: 'pixel',    api: 36, tag: 'google_apis', width: 1280, height: 2856, density: 480, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 9',         profile: 'pixel_9',              sdkProfile: 'pixel_9',              group: 'pixel',    api: 36, tag: 'google_apis', width: 1080, height: 2424, density: 420, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 9a',        profile: 'pixel_9a',             sdkProfile: 'pixel_9a',             group: 'pixel',    api: 36, tag: 'google_apis', width: 1080, height: 2424, density: 420, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 8 Pro',     profile: 'pixel_8_pro',          sdkProfile: 'pixel_8_pro',          group: 'pixel',    api: 34, tag: 'google_apis', width: 1344, height: 2992, density: 480, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 8',         profile: 'pixel_8',              sdkProfile: 'pixel_8',              group: 'pixel',    api: 34, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 7 Pro',     profile: 'pixel_7_pro',          sdkProfile: 'pixel_7_pro',          group: 'pixel',    api: 33, tag: 'google_apis', width: 1440, height: 3120, density: 560, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 7',         profile: 'pixel_7',              sdkProfile: 'pixel_7',              group: 'pixel',    api: 33, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 7a',        profile: 'pixel_7a',             sdkProfile: 'pixel_7a',             group: 'pixel',    api: 33, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 6 Pro',     profile: 'pixel_6_pro',          sdkProfile: 'pixel_6_pro',          group: 'pixel',    api: 32, tag: 'google_apis', width: 1440, height: 3120, density: 560, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 6',         profile: 'pixel_6',              sdkProfile: 'pixel_6',              group: 'pixel',    api: 32, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 6a',        profile: 'pixel_6a',             sdkProfile: 'pixel_6a',             group: 'pixel',    api: 32, tag: 'google_apis', width: 1080, height: 2400, density: 420, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Pixel 4 XL',      profile: 'pixel_4_xl',           sdkProfile: 'pixel_4_xl',           group: 'pixel',    api: 30, tag: 'google_apis', width: 1440, height: 3040, density: 560, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Nexus 5X',        profile: 'Nexus 5X',             sdkProfile: 'Nexus 5X',             group: 'pixel',    api: 28, tag: 'google_apis', width: 1080, height: 1920, density: 420, ram: 2560, heap: 320, orientation: 'portrait',  dataPartition: '2G', manufacturer: 'Google' },
+
+  // ── Samsung Galaxy ────────────────────────────────────────────────────────
+  // No sdkProfile: avdmanager has never shipped a Samsung device definition, so
+  // the hardware below is authoritative rather than a fallback.
+  { name: 'Galaxy S25 Ultra', profile: 'samsung_galaxy_s25_ultra', group: 'samsung', api: 35, tag: 'google_apis', width: 1440, height: 3120, density: 600, ram: 2560, heap: 320, orientation: 'portrait', dataPartition: '6G', manufacturer: 'Samsung' },
+  { name: 'Galaxy S25 Plus',  profile: 'samsung_galaxy_s25_plus',  group: 'samsung', api: 35, tag: 'google_apis', width: 1440, height: 3120, density: 560, ram: 2560, heap: 320, orientation: 'portrait', dataPartition: '6G', manufacturer: 'Samsung' },
+  { name: 'Galaxy S25',       profile: 'samsung_galaxy_s25',       group: 'samsung', api: 35, tag: 'google_apis', width: 1080, height: 2340, density: 480, ram: 2560, heap: 320, orientation: 'portrait', dataPartition: '6G', manufacturer: 'Samsung' },
+  { name: 'Galaxy S24 Ultra', profile: 'samsung_galaxy_s24_ultra', group: 'samsung', api: 34, tag: 'google_apis', width: 1440, height: 3120, density: 600, ram: 2560, heap: 320, orientation: 'portrait', dataPartition: '6G', manufacturer: 'Samsung' },
+  { name: 'Galaxy S24',       profile: 'samsung_galaxy_s24',       group: 'samsung', api: 34, tag: 'google_apis', width: 1080, height: 2340, density: 480, ram: 2560, heap: 320, orientation: 'portrait', dataPartition: '6G', manufacturer: 'Samsung' },
+  { name: 'Galaxy A55',       profile: 'samsung_galaxy_a55',       group: 'samsung', api: 34, tag: 'google_apis', width: 1080, height: 2340, density: 420, ram: 2560, heap: 320, orientation: 'portrait', dataPartition: '6G', manufacturer: 'Samsung' },
+
+  // ── Other phones ──────────────────────────────────────────────────────────
+  { name: 'OnePlus 13',    profile: 'oneplus_13',    group: 'phone', api: 35, tag: 'google_apis', width: 1440, height: 3168, density: 560, ram: 2560, heap: 320, orientation: 'portrait', dataPartition: '6G', manufacturer: 'OnePlus' },
+  { name: 'OnePlus 12',    profile: 'oneplus_12',    group: 'phone', api: 34, tag: 'google_apis', width: 1440, height: 3168, density: 560, ram: 2560, heap: 320, orientation: 'portrait', dataPartition: '6G', manufacturer: 'OnePlus' },
+  { name: 'Xiaomi 14',     profile: 'xiaomi_14',     group: 'phone', api: 34, tag: 'google_apis', width: 1200, height: 2670, density: 480, ram: 2560, heap: 320, orientation: 'portrait', dataPartition: '6G', manufacturer: 'Xiaomi' },
+  { name: 'Redmi Note 13', profile: 'redmi_note_13', group: 'phone', api: 34, tag: 'google_apis', width: 1080, height: 2400, density: 440, ram: 2560, heap: 320, orientation: 'portrait', dataPartition: '6G', manufacturer: 'Xiaomi' },
+
+  // ── Foldables (dimensions are the unfolded inner display) ─────────────────
+  { name: 'Pixel 10 Pro Fold', profile: 'pixel_10_pro_fold', sdkProfile: 'pixel_10_pro_fold', group: 'foldable', api: 36, tag: 'google_apis', width: 2152, height: 2076, density: 420, ram: 3072, heap: 384, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Google',  foldable: true },
+  { name: 'Pixel Fold',        profile: 'pixel_fold',        sdkProfile: 'pixel_fold',        group: 'foldable', api: 34, tag: 'google_apis', width: 2208, height: 1840, density: 420, ram: 3072, heap: 384, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Google',  foldable: true },
+  { name: 'Galaxy Z Fold 6',   profile: 'samsung_galaxy_z_fold_6', group: 'foldable', api: 35, tag: 'google_apis', width: 2160, height: 1856, density: 420, ram: 3072, heap: 384, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Samsung', foldable: true },
+  { name: 'Galaxy Z Flip 6',   profile: 'samsung_galaxy_z_flip_6', group: 'foldable', api: 35, tag: 'google_apis', width: 1080, height: 2640, density: 420, ram: 3072, heap: 384, orientation: 'portrait',  dataPartition: '6G', manufacturer: 'Samsung', foldable: true },
+
+  // ── Tablets ───────────────────────────────────────────────────────────────
+  { name: 'Pixel Tablet',         profile: 'pixel_tablet',              sdkProfile: 'pixel_tablet',              group: 'tablet', api: 34, tag: 'google_apis', width: 2560, height: 1600, density: 320, ram: 3072, heap: 384, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Google' },
+  { name: 'Galaxy Tab S10 Ultra', profile: 'samsung_galaxy_tab_s10_ultra', group: 'tablet', api: 35, tag: 'google_apis', width: 2960, height: 1848, density: 320, ram: 3072, heap: 384, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Samsung' },
+  { name: 'Galaxy Tab S9',        profile: 'samsung_galaxy_tab_s9',        group: 'tablet', api: 34, tag: 'google_apis', width: 2560, height: 1600, density: 320, ram: 3072, heap: 384, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Samsung' },
+  { name: 'OnePlus Pad 2',        profile: 'oneplus_pad_2',                group: 'tablet', api: 34, tag: 'google_apis', width: 3000, height: 2120, density: 320, ram: 3072, heap: 384, orientation: 'landscape', dataPartition: '6G', manufacturer: 'OnePlus' },
+  { name: '7" Tablet',            profile: '7in WSVGA (Tablet)',   sdkProfile: '7in WSVGA (Tablet)',   group: 'tablet', api: 36, tag: 'google_apis', width: 1024, height:  600, density: 160, ram: 3072, heap: 384, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Generic' },
+  { name: '10" Tablet',           profile: '10.1in WXGA (Tablet)', sdkProfile: '10.1in WXGA (Tablet)', group: 'tablet', api: 36, tag: 'google_apis', width: 1280, height:  800, density: 160, ram: 3072, heap: 384, orientation: 'landscape', dataPartition: '6G', manufacturer: 'Generic' },
 ];
+
+/**
+ * Default AVD name for a preset, safe for the `/^[a-zA-Z0-9_.-]+$/` validator.
+ *
+ * Stripping only whitespace is not enough: `7" Tablet` produced `7"_Tablet_API36`,
+ * which the very next input box rejected.
+ */
+export function avdNameForPreset(preset: DevicePreset): string {
+  const slug = preset.name.replace(/[^a-zA-Z0-9_.-]+/g, '_').replace(/^_+|_+$/g, '');
+  return `${slug}_API${preset.api}`;
+}
 
 /** Look up a preset by its avdmanager device-profile id. */
 export function findPresetByProfileId(id: string): DevicePreset | undefined {
@@ -218,7 +299,13 @@ export function findPresetForAvd(
     if (hit) { return hit; }
   }
   const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
-  const haystack = slug(`${config['avd.ini.displayname'] || ''} ${avdName}`);
+  // Drop a trailing "_API34"/"API 34" first. Slugging eats the separators, so
+  // the A of API fuses onto the model number and "Pixel_6_API32" -> "pixel6api32"
+  // matches the "pixel6a" of Pixel 6a — the wrong device, one letter away.
+  const dropApiSuffix = (s: string) => s.replace(/[_\s-]*api[_\s-]*\d+\s*$/i, '');
+  const haystack = slug(
+    `${dropApiSuffix(config['avd.ini.displayname'] || '')} ${dropApiSuffix(avdName)}`
+  );
   // Longest name first, so "Pixel 9 Pro" wins over "Pixel 9".
   return [...DEVICE_PRESETS]
     .sort((a, b) => b.name.length - a.name.length)

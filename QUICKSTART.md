@@ -39,7 +39,7 @@ code --install-extension CaspianTools.caspian-emulator
 
 | Action | How |
 |--------|-----|
-| Create virtual device | Click **+** in the Virtual Devices panel → pick Pixel 9, Pixel 8, etc. |
+| Create virtual device | Click **+** in the Virtual Devices panel → pick from 37 presets (Pixel, Galaxy, OnePlus, Xiaomi, foldables, tablets) |
 | Launch emulator | Click the **play** button next to an AVD |
 | Stop emulator | Click the **stop** button on a running AVD |
 | Connect phone | Command Palette → **Caspian: Connect Phone via USB** |

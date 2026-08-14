@@ -97,6 +97,10 @@ a command handler.
 create avd` writes no `hw.lcd.*` when it has no `-d <profile>` to work from, and
 the emulator then falls back to 320x640 @ 160 dpi with 96 MB of RAM. `AvdManager`
 therefore writes the preset's real hardware into `config.ini` after creation.
+For presets carrying an `sdkProfile` this is a fallback and the SDK's own values
+win; for the rest — every Samsung, OnePlus and Xiaomi entry, which no SDK has
+ever had a definition for — `-d` is skipped up front and the preset's hardware
+*is* the device.
 `adb shell wm size` is deliberately never used as a fix — it only changes
 WindowManager's logical size, lives in `/data`, and is lost on wipe. It is
 offered as `reset` only.

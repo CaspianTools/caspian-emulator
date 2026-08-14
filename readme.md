@@ -31,14 +31,14 @@ No Android Studio. No manual path configuration. Just install the extension and 
 - Requires only **Java 17+** — everything else is handled
 
 ### AVD Management
-- Create virtual devices by name — pick **Pixel 9 Pro**, **Pixel 8**, **Pixel Fold**, **Pixel Tablet**, and more from a preset list
+- Create virtual devices by name — **37 presets** grouped as Google Pixel, Samsung Galaxy, Other phones, Foldables and Tablets: the Pixel 10 and 9 lines, **Galaxy S25 Ultra**, **Galaxy Z Fold 6**, **Galaxy Z Flip 6**, **OnePlus 13**, **Xiaomi 14**, **Galaxy Tab S10 Ultra**, **OnePlus Pad 2**, and more. Search by manufacturer or resolution as well as by name
 - System image downloaded automatically if not installed (~1 GB) — and if you already have a **newer** one, that is used instead of downloading an older one
 - Launch, stop, delete, clone, and edit AVDs from the sidebar
 - **Cold boot** option — launch without loading snapshots
 - **Clone AVD** — duplicate an existing virtual device for testing variations
 - Boot progress notification — shows progress while emulator starts
 - See running/stopped status at a glance with color-coded icons
-- **Correct hardware, always** — presets carry the real resolution, density, and RAM of the device they name, even when your SDK's command-line tools predate that device profile
+- **Correct hardware, always** — presets carry the real resolution, density, and RAM of the device they name, even when your SDK's command-line tools predate that device profile. For Samsung, OnePlus and Xiaomi devices, which no Android SDK has ever carried a definition for, Caspian configures the display itself — with densities chosen so the **dp** size matches the real hardware, since dp is what your layouts respond to
 - **Resolution shown in the sidebar**, with a warning icon and one-click repair for any misconfigured virtual device
 - **Low-memory pre-flight** — warns before a launch that would hang, names the processes eating your RAM, and offers to stop the build daemons holding it. If `gradlew --stop` frees nothing (it cannot stop the Kotlin compile daemon, usually the larger of the two) Caspian says so and offers to stop what is left, rather than going quiet and letting you assume it worked
 - **Acceleration check** — tells you when WHPX/HAXM/KVM is missing instead of letting the emulator hang in software mode
@@ -140,7 +140,7 @@ Browse the device filesystem from the sidebar:
 ### Install
 Search **"Caspian Emulator"** in the VS Code Extensions panel, or:
 ```bash
-code --install-extension caspian-emulator-1.3.0.vsix
+code --install-extension caspian-emulator-1.4.0.vsix
 ```
 
 ### First Launch

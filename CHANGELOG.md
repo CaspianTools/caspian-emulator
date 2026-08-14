@@ -2,6 +2,20 @@
 
 All notable changes to Caspian Emulator will be documented in this file.
 
+## [1.4.0] - 2026-08-14
+
+### Added
+- **21 new device presets, and the picker is now grouped.** The preset list was thirteen Pixels, a Nexus 5X, and two generic tablets — so "test on a range of devices" meant testing on one manufacturer. Added the Pixel 10 line (10, 10 Pro, 10 Pro XL, 10 Pro Fold), Pixel 9 Pro XL and 9a, six Samsung Galaxy phones (S25 Ultra / S25 Plus / S25 / S24 Ultra / S24 / A55), the Galaxy Z Fold 6 and Z Flip 6, OnePlus 13 and 12, Xiaomi 14, Redmi Note 13, and four more tablets (Galaxy Tab S10 Ultra, Galaxy Tab S9, OnePlus Pad 2, Pixel Tablet). 37 devices in all, under **Google Pixel**, **Samsung Galaxy**, **Other phones**, **Foldables** and **Tablets** headings, searchable by manufacturer or resolution as well as by name
+- **Non-Google devices are configured directly, and said so honestly.** `avdmanager` has never shipped a Samsung, OnePlus, or Xiaomi device definition, so these presets skip `-d` entirely rather than attempting it and falling back. Densities are chosen so the resulting **dp** size matches the real hardware — a Galaxy S25 Ultra is 1440 px wide at 600 dpi, i.e. 384dp, not the 411dp a Pixel-like 560 dpi would give — because dp is what layouts actually respond to
+
+### Fixed
+- **Every preset AVD was born wearing a "low RAM" warning.** All presets carried `ram: 2048`, but the guest-RAM floor for a Google APIs image at API 33+ is 2560 MB, so a freshly created device failed the extension's own health check on the spot. Phones are now 2560 MB and foldables/tablets 3072 MB, with heap sizes derived from the floor rather than hand-written. This applies to the older presets too: an API level is a floor, so a Pixel 6 preset is routinely paired with a far newer system image
+- **A preset whose name contained anything but letters or spaces produced an AVD name the next prompt rejected.** The default name stripped whitespace only, so `7" Tablet` became `7"_Tablet_API36` and failed validation immediately
+- **A Pixel 6 virtual device offered Pixel 6a hardware when repaired.** Preset matching strips punctuation before comparing, which fuses the *A* of `_API32` onto the model number: `Pixel_6_API32` becomes `pixel6api32`, which contains `pixel6a`. The API suffix is now removed before matching
+
+### Changed
+- **The repair dialog's resolution list is derived from the preset table** instead of being a second hardcoded copy of it, so the two can no longer drift apart
+
 ## [1.3.0] - 2026-08-14
 
 ### Added
