@@ -2,7 +2,7 @@
   "name": "caspian-emulator",
   "displayName": "Caspian Emulator",
   "description": "Android emulator management for VS Code — no Android Studio required. AVD control, store screenshot capture, locale and accessibility sweeps, embedded screen, ADB tools, logcat viewer, and automatic SDK setup.",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "publisher": "CaspianTools",
   "license": "MIT",
   "engines": {
