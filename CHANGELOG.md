@@ -2,6 +2,11 @@
 
 All notable changes to Caspian Emulator will be documented in this file.
 
+## [1.4.1] - 2026-11-20
+
+### Changed
+- Owner actions are GitHub issues in the standard layout, each linking the session that asked (owner, 20 Nov 2026). Contributor instructions only; the extension itself is unchanged.
+
 ## [1.4.0] - 2026-08-14
 
 ### Added
